@@ -23,7 +23,6 @@ const TELEMETRY_TIMEOUT_MS = 1_500;
 const CB_WINDOW_MS = 5 * 60 * 1_000;
 const CB_TRIP_FAILURE_RATIO = 0.05;
 const CB_MIN_SAMPLES = 20;
-const SAMPLED_DROP_LOG_RATE = 0.01;
 
 function isUsageEnabled(): boolean {
   return process.env.USAGE_TELEMETRY === '1';
@@ -354,25 +353,35 @@ export function getUsageScope(): UsageScope | undefined {
 // ---------- Sink ----------
 
 export async function sendToAxiom(events: UsageEvent[]): Promise<void> {
-  if (!isUsageEnabled()) return;
+  // TEMP DEBUG: unconditional entry log to verify codepath in preview.
+  // Remove before merging to main.
+  console.log('[usage-telemetry][debug] sendToAxiom enter', {
+    enabled: isUsageEnabled(),
+    eventCount: events.length,
+    tokenPresent: Boolean(process.env.AXIOM_API_TOKEN),
+    tokenLen: (process.env.AXIOM_API_TOKEN ?? '').length,
+    breakerTripped,
+    url: AXIOM_INGEST_URL,
+  });
+  if (!isUsageEnabled()) {
+    console.log('[usage-telemetry][debug] drop: not enabled');
+    return;
+  }
   if (events.length === 0) return;
   const token = process.env.AXIOM_API_TOKEN;
   if (!token) {
-    if (Math.random() < SAMPLED_DROP_LOG_RATE) {
-      console.warn('[usage-telemetry] drop', { reason: 'no-token' });
-    }
+    console.warn('[usage-telemetry][debug] drop: no-token');
     return;
   }
   if (breakerTripped) {
-    if (Math.random() < SAMPLED_DROP_LOG_RATE) {
-      console.warn('[usage-telemetry] drop', { reason: 'breaker-open' });
-    }
+    console.warn('[usage-telemetry][debug] drop: breaker-open');
     return;
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TELEMETRY_TIMEOUT_MS);
   try {
+    console.log('[usage-telemetry][debug] POSTing', { eventCount: events.length, firstEventType: events[0]?.event_type });
     const resp = await fetch(AXIOM_INGEST_URL, {
       method: 'POST',
       headers: {
@@ -382,20 +391,18 @@ export async function sendToAxiom(events: UsageEvent[]): Promise<void> {
       body: JSON.stringify(events),
       signal: controller.signal,
     });
+    console.log('[usage-telemetry][debug] response', { status: resp.status, ok: resp.ok });
     if (!resp.ok) {
+      const bodyText = await resp.text().catch(() => '<unreadable>');
+      console.warn('[usage-telemetry][debug] axiom rejected', { status: resp.status, body: bodyText.slice(0, 500) });
       recordSample(false);
-      if (Math.random() < SAMPLED_DROP_LOG_RATE) {
-        console.warn('[usage-telemetry] drop', { reason: `http-${resp.status}` });
-      }
       return;
     }
     recordSample(true);
   } catch (err) {
     recordSample(false);
-    if (Math.random() < SAMPLED_DROP_LOG_RATE) {
-      const reason = err instanceof Error && err.name === 'AbortError' ? 'timeout' : 'fetch-error';
-      console.warn('[usage-telemetry] drop', { reason });
-    }
+    const reason = err instanceof Error && err.name === 'AbortError' ? 'timeout' : 'fetch-error';
+    console.warn('[usage-telemetry][debug] fetch failed', { reason, message: err instanceof Error ? err.message : String(err) });
   } finally {
     clearTimeout(timer);
   }
