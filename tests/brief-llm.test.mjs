@@ -20,6 +20,7 @@ import {
   parseDigestProse,
   validateDigestProseShape,
   generateDigestProse,
+  generateDigestProsePublic,
   enrichBriefEnvelopeWithLLM,
   buildStoryDescriptionPrompt,
   parseStoryDescription,
@@ -47,7 +48,7 @@ function story(overrides = {}) {
 
 function envelope(overrides = {}) {
   return {
-    version: 2,
+    version: 3,
     issuedAt: 1_745_000_000_000,
     data: {
       user: { name: 'Reader', tz: 'UTC' },
@@ -249,8 +250,12 @@ describe('buildDigestPrompt', () => {
     const { system, user } = buildDigestPrompt([story(), story({ headline: 'Second', country: 'PS' })], 'critical');
     assert.match(system, /chief editor of WorldMonitor Brief/);
     assert.match(user, /Reader sensitivity level: critical/);
-    assert.match(user, /01\. \[critical\] Iran threatens/);
-    assert.match(user, /02\. \[critical\] Second/);
+    // v3 prompt format: "01. [h:XXXX] [SEVERITY] Headline" — includes
+    // a short hash prefix for ranking and uppercases severity to
+    // emphasise editorial importance to the model. Hash falls back
+    // to "p<NN>" position when story.hash is absent (test fixtures).
+    assert.match(user, /01\. \[h:p?[a-z0-9]+\] \[CRITICAL\] Iran threatens/);
+    assert.match(user, /02\. \[h:p?[a-z0-9]+\] \[CRITICAL\] Second/);
   });
 
   it('caps at 12 stories', () => {
@@ -258,6 +263,42 @@ describe('buildDigestPrompt', () => {
     const { user } = buildDigestPrompt(many, 'all');
     const lines = user.split('\n').filter((l) => /^\d{2}\. /.test(l));
     assert.equal(lines.length, 12);
+  });
+
+  it('opens lead with greeting when ctx.greeting set and not public', () => {
+    const { user } = buildDigestPrompt([story()], 'critical', { greeting: 'Good morning', isPublic: false });
+    assert.match(user, /Open the lead with: "Good morning\."/);
+  });
+
+  it('omits greeting and profile when ctx.isPublic=true', () => {
+    const { user } = buildDigestPrompt([story()], 'critical', {
+      profile: 'Watching: oil futures, Strait of Hormuz',
+      greeting: 'Good morning',
+      isPublic: true,
+    });
+    assert.doesNotMatch(user, /Good morning/);
+    assert.doesNotMatch(user, /Watching:/);
+  });
+
+  it('includes profile lines when ctx.profile set and not public', () => {
+    const { user } = buildDigestPrompt([story()], 'critical', {
+      profile: 'Watching: oil futures',
+      isPublic: false,
+    });
+    assert.match(user, /Reader profile/);
+    assert.match(user, /Watching: oil futures/);
+  });
+
+  it('emits stable [h:XXXX] short-hash prefix derived from story.hash', () => {
+    const s = story({ hash: 'abc12345xyz9876' });
+    const { user } = buildDigestPrompt([s], 'critical');
+    // Short hash is first 8 chars of the digest story hash.
+    assert.match(user, /\[h:abc12345\]/);
+  });
+
+  it('asks model to emit rankedStoryHashes in JSON output (system prompt)', () => {
+    const { system } = buildDigestPrompt([story()], 'critical');
+    assert.match(system, /rankedStoryHashes/);
   });
 });
 
@@ -426,8 +467,11 @@ describe('generateDigestProse', () => {
     // `threads`, which the renderer's assertBriefEnvelope requires.
     const llm1 = makeLLM(validJson);
     await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm1.callLLM });
-    // Corrupt the stored row in place
-    const badKey = [...cache.store.keys()].find((k) => k.startsWith('brief:llm:digest:v2:'));
+    // Corrupt the stored row in place. Cache key prefix bumped to v3
+    // (2026-04-25) when the digest hash gained ctx (profile, greeting,
+    // isPublic) and per-story `hash` fields. v2 rows are ignored on
+    // rollout; v3 is the active prefix.
+    const badKey = [...cache.store.keys()].find((k) => k.startsWith('brief:llm:digest:v3:'));
     assert.ok(badKey, 'expected a digest prose cache entry');
     cache.store.set(badKey, { lead: 'short', /* missing threads + signals */ });
     const llm2 = makeLLM(validJson);
@@ -452,6 +496,10 @@ describe('validateDigestProseShape', () => {
     assert.ok(out);
     assert.notEqual(out, good, 'must not return the caller object by reference');
     assert.equal(out.threads.length, 1);
+    // v3: rankedStoryHashes is always present in the normalised
+    // output (defaults to [] when source lacks the field — keeps the
+    // shape stable for downstream consumers).
+    assert.ok(Array.isArray(out.rankedStoryHashes));
   });
 
   it('rejects missing threads', () => {
@@ -468,6 +516,128 @@ describe('validateDigestProseShape', () => {
     assert.equal(validateDigestProseShape(undefined), null);
     assert.equal(validateDigestProseShape([good]), null);
     assert.equal(validateDigestProseShape('string'), null);
+  });
+
+  it('preserves rankedStoryHashes when present (v3 path)', () => {
+    const out = validateDigestProseShape({
+      ...good,
+      rankedStoryHashes: ['abc12345', 'def67890', 'short', 'ok'],
+    });
+    assert.ok(out);
+    // 'short' (5 chars) keeps; 'ok' (2 chars) drops below the ≥4-char floor.
+    assert.deepEqual(out.rankedStoryHashes, ['abc12345', 'def67890', 'short']);
+  });
+
+  it('drops malformed rankedStoryHashes entries without rejecting the payload', () => {
+    const out = validateDigestProseShape({
+      ...good,
+      rankedStoryHashes: ['valid_hash', null, 42, '', '   ', 'bb'],
+    });
+    assert.ok(out, 'malformed ranking entries do not invalidate the whole object');
+    assert.deepEqual(out.rankedStoryHashes, ['valid_hash']);
+  });
+
+  it('returns empty rankedStoryHashes when field absent (v2-shaped row passes)', () => {
+    const out = validateDigestProseShape(good);
+    assert.deepEqual(out.rankedStoryHashes, []);
+  });
+});
+
+// ── generateDigestProsePublic + cache-key independence (Codex Round-2 #4) ──
+
+describe('generateDigestProsePublic — public cache shared across users', () => {
+  const stories = [story(), story({ headline: 'Second', country: 'PS' })];
+  const validJson = JSON.stringify({
+    lead: 'A non-personalised editorial lead generated for the share-URL surface, free of profile context.',
+    threads: [{ tag: 'Energy', teaser: 'Hormuz tensions resurface today.' }],
+    signals: ['Watch for naval redeployment in the Gulf.'],
+  });
+
+  it('two distinct callers with identical (sensitivity, story-pool) hit the SAME cache row', async () => {
+    // The whole point of generateDigestProsePublic: when the share
+    // URL is opened by 1000 different anonymous readers, only the
+    // first call hits the LLM. Every subsequent call serves the
+    // same cached output. (Internally: hashDigestInput substitutes
+    // 'public' for userId when ctx.isPublic === true.)
+    const cache = makeCache();
+    const llm1 = makeLLM(validJson);
+    await generateDigestProsePublic(stories, 'critical', { ...cache, callLLM: llm1.callLLM });
+    assert.equal(llm1.calls.length, 1);
+
+    // Second call — different "user" context (the wrapper takes no
+    // userId, so this is just a second invocation), same pool.
+    // Should hit cache, NOT re-LLM.
+    const llm2 = makeLLM(() => { throw new Error('would not be called'); });
+    const out = await generateDigestProsePublic(stories, 'critical', { ...cache, callLLM: llm2.callLLM });
+    assert.ok(out);
+    assert.equal(llm2.calls.length, 0, 'public cache shared across calls — no per-user inflation');
+  });
+
+  it('does NOT collide with the personalised cache for the same story pool', async () => {
+    // Defensive: a private call (with profile/greeting/userId) and a
+    // public call must produce DIFFERENT cache keys. Otherwise a
+    // private call could poison the public cache row (or vice versa).
+    const cache = makeCache();
+    const llm = makeLLM(validJson);
+
+    await generateDigestProsePublic(stories, 'critical', { ...cache, callLLM: llm.callLLM });
+    const publicKeys = [...cache.store.keys()];
+
+    await generateDigestProse('user_xyz', stories, 'critical',
+      { ...cache, callLLM: llm.callLLM },
+      { profile: 'Watching: oil', greeting: 'Good morning', isPublic: false },
+    );
+    const privateKeys = [...cache.store.keys()].filter((k) => !publicKeys.includes(k));
+
+    assert.equal(publicKeys.length, 1, 'one public cache row');
+    assert.equal(privateKeys.length, 1, 'private call writes its own row');
+    assert.notEqual(publicKeys[0], privateKeys[0], 'public + private rows must use distinct keys');
+    // Public key contains literal "public:" segment — userId substitution
+    assert.match(publicKeys[0], /:public:/);
+    // Private key contains the userId
+    assert.match(privateKeys[0], /:user_xyz:/);
+  });
+
+  it('greeting changes invalidate the personalised cache (per Brain B parity)', async () => {
+    // Brain B's old cache (digest:ai-summary:v1) included greeting in
+    // the key — morning prose differed from afternoon prose. The
+    // canonical synthesis preserves that semantic via greetingBucket.
+    const cache = makeCache();
+    const llm1 = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all',
+      { ...cache, callLLM: llm1.callLLM },
+      { greeting: 'Good morning', isPublic: false },
+    );
+    const llm2 = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all',
+      { ...cache, callLLM: llm2.callLLM },
+      { greeting: 'Good evening', isPublic: false },
+    );
+    assert.equal(llm2.calls.length, 1, 'greeting bucket change re-keys the cache');
+  });
+
+  it('profile changes invalidate the personalised cache', async () => {
+    const cache = makeCache();
+    const llm1 = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all',
+      { ...cache, callLLM: llm1.callLLM },
+      { profile: 'Watching: oil', isPublic: false },
+    );
+    const llm2 = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all',
+      { ...cache, callLLM: llm2.callLLM },
+      { profile: 'Watching: gas', isPublic: false },
+    );
+    assert.equal(llm2.calls.length, 1, 'profile change re-keys the cache');
+  });
+
+  it('writes to cache under brief:llm:digest:v3 prefix (not v2)', async () => {
+    const cache = makeCache();
+    const llm = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm.callLLM });
+    const keys = [...cache.store.keys()];
+    assert.ok(keys.some((k) => k.startsWith('brief:llm:digest:v3:')), 'v3 prefix used');
+    assert.ok(!keys.some((k) => k.startsWith('brief:llm:digest:v2:')), 'no v2 writes');
   });
 });
 

@@ -33,12 +33,25 @@ const { normalizeResendSender } = require('./lib/resend-from.cjs');
 import { readRawJsonFromUpstash, redisPipeline } from '../api/_upstash-json.js';
 import {
   composeBriefFromDigestStories,
+  compareRules,
   extractInsights,
   groupEligibleRulesByUser,
+  MAX_STORIES_PER_USER,
   shouldExitNonZero as shouldExitOnBriefFailures,
 } from './lib/brief-compose.mjs';
+import {
+  digestWindowStartMs,
+  pickWinningCandidateWithPool,
+  runSynthesisWithFallback,
+  subjectForBrief,
+} from './lib/digest-orchestration-helpers.mjs';
 import { issueSlotInTz } from '../shared/brief-filter.js';
-import { enrichBriefEnvelopeWithLLM } from './lib/brief-llm.mjs';
+import {
+  enrichBriefEnvelopeWithLLM,
+  generateDigestProse,
+  generateDigestProsePublic,
+  greetingBucket,
+} from './lib/brief-llm.mjs';
 import { parseDigestOnlyUser } from './lib/digest-only-user.mjs';
 import { assertBriefEnvelope } from '../server/_shared/brief-render.js';
 import { signBriefUrl, BriefUrlError } from './lib/brief-url-sign.mjs';
@@ -93,7 +106,6 @@ const DIGEST_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 24h default lookback on first
 const DIGEST_CRITICAL_LIMIT = Infinity;
 const DIGEST_HIGH_LIMIT = 15;
 const DIGEST_MEDIUM_LIMIT = 10;
-const AI_SUMMARY_CACHE_TTL = 3600; // 1h
 const AI_DIGEST_ENABLED = process.env.AI_DIGEST_ENABLED !== '0';
 const ENTITLEMENT_CACHE_TTL = 900; // 15 min
 
@@ -116,12 +128,13 @@ const BRIEF_URL_SIGNING_SECRET = process.env.BRIEF_URL_SIGNING_SECRET ?? '';
 const WORLDMONITOR_PUBLIC_BASE_URL =
   process.env.WORLDMONITOR_PUBLIC_BASE_URL ?? 'https://worldmonitor.app';
 const BRIEF_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
-// The brief is a once-per-day editorial snapshot. 24h is the natural
-// window regardless of a user's email cadence (daily / twice_daily /
-// weekly) — weekly subscribers still expect a fresh brief each day
-// in the dashboard panel. Matches DIGEST_LOOKBACK_MS so first-send
-// users see identical story pools in brief and email.
-const BRIEF_STORY_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Brief story window: derived per-rule from the rule's lastSentAt via
+// digestWindowStartMs, identical to the send-loop window. The previous
+// fixed-24h constant decoupled the canonical brief lead from the
+// stories the email/Slack body actually shipped, reintroducing the
+// cross-surface divergence the canonical-brain refactor is designed to
+// eliminate (especially severe for weekly users — 7d email body vs 24h
+// lead).
 const INSIGHTS_KEY = 'news:insights:v1';
 
 // Operator kill switch — used to intentionally silence brief compose
@@ -307,6 +320,66 @@ function toLocalHour(nowMs, timezone) {
   } catch {
     return -1;
   }
+}
+
+/**
+ * Read digest:last-sent:v1:{userId}:{variant} from Upstash. Returns
+ * null on miss / parse error / network hiccup so the caller can treat
+ * "first send" and "transient lookup failure" the same way (both fall
+ * through to isDue's `lastSentAt === null` branch). Extracted so the
+ * compose-flow's per-rule annotation pass and the send loop can share
+ * one source of truth — Codex Round-3 High #1 + Round-4 fixes.
+ *
+ * @param {{ userId: string; variant?: string }} rule
+ * @returns {Promise<number | null>}
+ */
+async function getLastSentAt(rule) {
+  if (!rule?.userId || !rule.variant) return null;
+  const key = `digest:last-sent:v1:${rule.userId}:${rule.variant}`;
+  try {
+    const raw = await upstashRest('GET', key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return typeof parsed.sentAt === 'number' ? parsed.sentAt : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the synthesis context (profile, greeting) for the canonical
+ * synthesis call. profile is the formatted user-context line block;
+ * greeting is the time-of-day-appropriate opener. Both are stripped
+ * by `generateDigestProsePublic` for the share-URL surface; this
+ * function is for the personalised path only.
+ *
+ * Defensive: prefs lookup failures degrade to a non-personalised
+ * synthesis (profile=null) rather than blocking the brief — same
+ * pattern the legacy generateAISummary used.
+ *
+ * @param {{ userId: string; variant?: string; digestTimezone?: string }} rule
+ * @param {number} nowMs
+ * @returns {Promise<{ profile: string | null; greeting: string | null }>}
+ */
+async function buildSynthesisCtx(rule, nowMs) {
+  if (!rule?.userId) return { profile: null, greeting: null };
+  let profile = null;
+  try {
+    const { data: prefs } = await fetchUserPreferences(rule.userId, rule.variant ?? 'full');
+    if (prefs) {
+      const ctx = extractUserContext(prefs);
+      profile = formatUserProfile(ctx, rule.variant ?? 'full');
+    }
+  } catch {
+    /* prefs unavailable — degrade to non-personalised */
+  }
+  const tz = rule.digestTimezone ?? 'UTC';
+  const localHour = toLocalHour(nowMs, tz);
+  const greeting = localHour >= 5 && localHour < 12 ? 'Good morning'
+    : localHour >= 12 && localHour < 17 ? 'Good afternoon'
+    : localHour >= 17 && localHour < 22 ? 'Good evening'
+    : 'Good evening';
+  return { profile, greeting };
 }
 
 function isDue(rule, lastSentAt) {
@@ -701,95 +774,23 @@ function formatDigestHtml(stories, nowMs) {
 </div>`;
 }
 
-// ── AI summary generation ────────────────────────────────────────────────────
-
-function hashShort(str) {
-  return createHash('sha256').update(str).digest('hex').slice(0, 16);
-}
-
-async function generateAISummary(stories, rule) {
-  if (!AI_DIGEST_ENABLED) return null;
-  if (!stories || stories.length === 0) return null;
-
-  // rule.aiDigestEnabled (from alertRules) is the user's explicit opt-in for
-  // AI summaries. userPreferences is a SEPARATE table (SPA app settings blob:
-  // watchlist, airports, panels). A user can have alertRules without having
-  // ever saved userPreferences — or under a different variant. Missing prefs
-  // must NOT silently disable the feature the user just enabled; degrade to
-  // a non-personalized summary instead.
-  //   error: true  = transient fetch failure (network, non-OK HTTP, env missing)
-  //   error: false = the (userId, variant) row genuinely does not exist
-  // Both cases degrade to a non-personalized summary, but log them distinctly
-  // so transient fetch failures are visible in observability.
-  const { data: prefs, error: prefsFetchError } = await fetchUserPreferences(rule.userId, rule.variant ?? 'full');
-  if (!prefs) {
-    console.log(
-      prefsFetchError
-        ? `[digest] Prefs fetch failed for ${rule.userId} — generating non-personalized AI summary`
-        : `[digest] No stored preferences for ${rule.userId} — generating non-personalized AI summary`,
-    );
-  }
-  const ctx = extractUserContext(prefs);
-  const profile = formatUserProfile(ctx, rule.variant ?? 'full');
-
-  const variant = rule.variant ?? 'full';
-  const tz = rule.digestTimezone ?? 'UTC';
-  const localHour = toLocalHour(Date.now(), tz);
-  if (localHour === -1) console.warn(`[digest] Bad timezone "${tz}" for ${rule.userId} — defaulting to evening greeting`);
-  const greeting = localHour >= 5 && localHour < 12 ? 'Good morning'
-    : localHour >= 12 && localHour < 17 ? 'Good afternoon'
-    : 'Good evening';
-  const storiesHash = hashShort(stories.map(s =>
-    `${s.titleHash ?? s.title}:${s.severity ?? ''}:${s.phase ?? ''}:${(s.sources ?? []).slice(0, 3).join(',')}`
-  ).sort().join('|'));
-  const ctxHash = hashShort(JSON.stringify(ctx));
-  const cacheKey = `digest:ai-summary:v1:${variant}:${greeting}:${storiesHash}:${ctxHash}`;
-
-  try {
-    const cached = await upstashRest('GET', cacheKey);
-    if (cached) {
-      console.log(`[digest] AI summary cache hit for ${rule.userId}`);
-      return cached;
-    }
-  } catch { /* miss */ }
-
-  const dateStr = new Date().toISOString().split('T')[0];
-  const storyList = stories.slice(0, 20).map((s, i) => {
-    const phase = s.phase ? ` [${s.phase}]` : '';
-    const src = s.sources?.length > 0 ? ` (${s.sources.slice(0, 2).join(', ')})` : '';
-    return `${i + 1}. [${(s.severity ?? 'high').toUpperCase()}]${phase} ${s.title}${src}`;
-  }).join('\n');
-
-  const systemPrompt = `You are WorldMonitor's intelligence analyst. Today is ${dateStr} UTC.
-Write a personalized daily brief for a user focused on ${rule.variant ?? 'full'} intelligence.
-The user's local time greeting is "${greeting}" — use this exact greeting to open the brief.
-
-User profile:
-${profile}
-
-Rules:
-- Open with "${greeting}." followed by the brief
-- Lead with the single most impactful development for this user
-- Connect events to watched assets/regions where relevant
-- 3-5 bullet points, 1-2 sentences each
-- Flag anything directly affecting watched assets
-- Separate facts from assessment
-- End with "Signals to watch:" (1-2 items)
-- Under 250 words`;
-
-  const summary = await callLLM(systemPrompt, storyList, { maxTokens: 600, temperature: 0.3, timeoutMs: 15_000, skipProviders: ['groq'] });
-  if (!summary) {
-    console.warn(`[digest] AI summary generation failed for ${rule.userId}`);
-    return null;
-  }
-
-  try {
-    await upstashRest('SET', cacheKey, summary, 'EX', String(AI_SUMMARY_CACHE_TTL));
-  } catch { /* best-effort cache write */ }
-
-  console.log(`[digest] AI summary generated for ${rule.userId} (${summary.length} chars)`);
-  return summary;
-}
+// ── (Removed) standalone generateAISummary ───────────────────────────────────
+//
+// Prior to 2026-04-25 a separate `generateAISummary()` here ran a
+// second LLM call per send to produce the email's exec-summary
+// block, independent of the brief envelope's `digest.lead`. That
+// asymmetry was the root cause of the email/brief contradiction
+// (different inputs, different leads, different ranked stories).
+//
+// The synthesis is now produced ONCE per user by
+// `generateDigestProse(userId, fullPool, sensitivity, deps, ctx)`
+// in composeAndStoreBriefForUser, written into
+// `envelope.data.digest.lead`, and read by every channel
+// (email HTML, plain-text, Telegram, Slack, Discord, webhook). See
+// docs/plans/2026-04-25-002-fix-brief-email-two-brain-divergence-plan.md.
+//
+// The `digest:ai-summary:v1:*` cache rows from the legacy code path
+// expire on their existing 1h TTL — no cleanup pass needed.
 
 // ── Channel deactivation ──────────────────────────────────────────────────────
 
@@ -1254,22 +1255,50 @@ async function composeBriefsForRun(rules, nowMs) {
   // inherits a looser populator's pool (the earlier populator "wins"
   // and decides which severity tiers enter the pool, so stricter
   // users get a pool that contains severities they never wanted).
-  const windowStart = nowMs - BRIEF_STORY_WINDOW_MS;
+  //
+  // windowStart is derived per-candidate from `lastSentAt`, matching
+  // the send loop's formula exactly (digestWindowStartMs). Without
+  // this, the canonical brief lead would be synthesized from a fixed
+  // 24h pool while the email/Slack body ships the actual cadence's
+  // window (7d for weekly, 12h for twice_daily) — a different flavor
+  // of the cross-surface divergence the canonical-brain refactor is
+  // designed to eliminate.
   const digestCache = new Map();
-  async function digestFor(candidate) {
-    const key = `${candidate.variant ?? 'full'}:${candidate.lang ?? 'en'}:${candidate.sensitivity ?? 'high'}:${windowStart}`;
+  async function digestFor(cand) {
+    const windowStart = digestWindowStartMs(cand.lastSentAt, nowMs, DIGEST_LOOKBACK_MS);
+    const key = `${cand.rule.variant ?? 'full'}:${cand.rule.lang ?? 'en'}:${cand.rule.sensitivity ?? 'high'}:${windowStart}`;
     if (digestCache.has(key)) return digestCache.get(key);
-    const stories = await buildDigest(candidate, windowStart);
+    const stories = await buildDigest(cand.rule, windowStart);
     digestCache.set(key, stories ?? []);
     return stories ?? [];
   }
 
-  const eligibleByUser = groupEligibleRulesByUser(rules);
+  // Pre-annotate every eligible rule with its lastSentAt + isDue
+  // status. The compose flow uses this to prefer a "due-this-tick"
+  // candidate as the canonical synthesis source, falling back to any
+  // eligible candidate when nothing is due (preserving today's
+  // dashboard refresh contract for weekly users on non-due ticks).
+  // Codex Round-3 High #1 + Round-4 High #1 + Round-4 Medium #2.
+  //
+  // One Upstash GET per rule per tick; with caching across rules of
+  // the same user this is cheap. The send loop in main() reads from
+  // this same map (via getLastSentAt) so compose + send agree on
+  // lastSentAt for every rule.
+  const annotatedByUser = new Map();
+  for (const [userId, candidates] of groupEligibleRulesByUser(rules)) {
+    const annotated = [];
+    for (const rule of candidates) {
+      const lastSentAt = await getLastSentAt(rule);
+      annotated.push({ rule, lastSentAt, due: isDue(rule, lastSentAt) });
+    }
+    annotatedByUser.set(userId, annotated);
+  }
+
   let composeSuccess = 0;
   let composeFailed = 0;
-  for (const [userId, candidates] of eligibleByUser) {
+  for (const [userId, annotated] of annotatedByUser) {
     try {
-      const hit = await composeAndStoreBriefForUser(userId, candidates, insightsNumbers, digestFor, nowMs);
+      const hit = await composeAndStoreBriefForUser(userId, annotated, insightsNumbers, digestFor, nowMs);
       if (hit) {
         briefByUser.set(userId, hit);
         composeSuccess++;
@@ -1284,114 +1313,188 @@ async function composeBriefsForRun(rules, nowMs) {
     }
   }
   console.log(
-    `[digest] brief: compose_success=${composeSuccess} compose_failed=${composeFailed} total_users=${eligibleByUser.size}`,
+    `[digest] brief: compose_success=${composeSuccess} compose_failed=${composeFailed} total_users=${annotatedByUser.size}`,
   );
   return { briefByUser, composeSuccess, composeFailed };
 }
 
 /**
- * Per-user: walk candidates, for each pull the per-variant digest
- * story pool (same pool buildDigest feeds to the email), and compose
- * the brief envelope from the first candidate that yields non-empty
- * stories. SETEX the envelope, sign the magazine URL. Returns the
- * entry the caller should stash in briefByUser, or null when no
- * candidate had stories.
+ * Per-user: pick a winning candidate (DUE rules first, then any
+ * eligible rule), pull its digest pool, run canonical synthesis
+ * over the FULL pre-cap pool, then compose the envelope with the
+ * synthesis spliced in. SETEX the envelope, sign the magazine URL.
+ *
+ * Returns the entry the caller should stash in briefByUser, or null
+ * when no candidate had stories. The entry's `synthesisLevel` field
+ * tells the send loop which fallback path produced the lead (1 =
+ * canonical, 2 = degraded, 3 = stub) — drives the email subject-line
+ * ternary and the parity log.
+ *
+ * @param {string} userId
+ * @param {Array<{ rule: object; lastSentAt: number | null; due: boolean }>} annotated
+ * @param {{ clusters: number; multiSource: number }} insightsNumbers
+ * @param {(rule: object) => Promise<unknown[]>} digestFor
+ * @param {number} nowMs
  */
-async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, digestFor, nowMs) {
-  let envelope = null;
-  let chosenVariant = null;
-  let chosenCandidate = null;
-  for (const candidate of candidates) {
-    const digestStories = await digestFor(candidate);
-    if (!digestStories || digestStories.length === 0) continue;
-    const dropStats = { severity: 0, headline: 0, url: 0, shape: 0, cap: 0, in: digestStories.length };
-    const composed = composeBriefFromDigestStories(
-      candidate,
-      digestStories,
-      insightsNumbers,
-      {
-        nowMs,
-        onDrop: (ev) => { dropStats[ev.reason] = (dropStats[ev.reason] ?? 0) + 1; },
+async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, digestFor, nowMs) {
+  // Two-pass walk extracted to a pure helper so it can be unit-tested
+  // (A6.l + A6.m). When no candidate has a non-empty pool — OR when
+  // every non-empty candidate has its stories filtered out by the
+  // composer (URL/headline/shape filters) — returns null.
+  //
+  // The `tryCompose` callback is the filter-rejection fall-through:
+  // before the original PR, the legacy loop kept trying lower-priority
+  // candidates whenever compose returned null. Without this hook the
+  // helper would claim the first non-empty pool as winner and the
+  // caller would bail on filter-drop, suppressing briefs that a
+  // lower-priority candidate would have produced.
+  //
+  // We compose WITHOUT synthesis here (cheap — pure JS, no I/O) just
+  // to check filter survival; the real composition with synthesis
+  // splice-in happens once below, after the winner is locked in.
+  const log = (line) => console.log(line);
+  const winnerResult = await pickWinningCandidateWithPool(
+    annotated,
+    digestFor,
+    log,
+    userId,
+    (cand, stories) => {
+      const test = composeBriefFromDigestStories(
+        cand.rule,
+        stories,
+        insightsNumbers,
+        { nowMs },
+      );
+      return test ?? null;
+    },
+  );
+  if (!winnerResult) return null;
+  const { winner, stories: winnerStories } = winnerResult;
+
+  // ── Canonical synthesis (3-level fallback chain) ────────────────────
+  //
+  // L1: full pre-cap pool + personalised ctx (profile, greeting). The
+  //     desired outcome — single LLM call per user, lead anchored on
+  //     the wider story set the model has the most signal from.
+  // L2: post-cap envelope-only + empty ctx. Mirrors today's
+  //     enrichBriefEnvelopeWithLLM behavior — used when L1 returns
+  //     null (LLM down across all providers, parse failure).
+  // L3: stub from assembleStubbedBriefEnvelope. The brief still
+  //     ships; only the lead text degrades. Email subject downgrades
+  //     from "Intelligence Brief" to "Digest" (driven by
+  //     synthesisLevel === 3 in the send loop).
+  const sensitivity = winner.rule.sensitivity ?? 'high';
+  let synthesis = null;
+  let publicLead = null;
+  let synthesisLevel = 3;  // pessimistic default; bumped on success
+  if (BRIEF_LLM_ENABLED) {
+    const ctx = await buildSynthesisCtx(winner.rule, nowMs);
+    const result = await runSynthesisWithFallback(
+      userId,
+      winnerStories,
+      sensitivity,
+      ctx,
+      briefLlmDeps,
+      (level, kind, err) => {
+        if (kind === 'throw') {
+          console.warn(
+            `[digest] brief: synthesis L${level} threw for ${userId} — falling to L${level + 1}:`,
+            err?.message,
+          );
+        } else if (kind === 'success' && level === 2) {
+          console.log(`[digest] synthesis level=2_degraded user=${userId}`);
+        } else if (kind === 'success' && level === 3) {
+          console.log(`[digest] synthesis level=3_stub user=${userId}`);
+        }
       },
     );
-
-    // Per-attempt filter-drop line. Emits one structured row for every
-    // candidate whose digest pool was non-empty, tagged with that
-    // candidate's own sensitivity and variant. See Solution 0 in
-    // docs/plans/2026-04-24-004-fix-brief-topic-adjacency-defects-plan.md
-    // for why this log exists (deciding whether Solution 3 is warranted).
-    //
-    // Emitting per attempt — not per user — because:
-    //   - A user can have multiple rules with different sensitivities;
-    //     a single-row-per-user log would have to either pick one
-    //     sensitivity arbitrarily or label as 'mixed', hiding drops
-    //     from the non-winning candidates.
-    //   - An earlier candidate wiped out by post-group filtering (the
-    //     exact signal Sol-0 targets) is invisible if only the winner
-    //     is logged. Every attempt emits its own row so the fallback
-    //     chain is visible.
-    //
-    // Outcomes per row:
-    //   outcome=shipped  — this candidate's envelope shipped; loop breaks.
-    //   outcome=rejected — composed was null (every story filtered out);
-    //                      loop continues to the next candidate.
-    //
-    // A user whose every row is `outcome=rejected` is a wipeout —
-    // operators detect it by grouping rows by user and checking for
-    // absence of `outcome=shipped` within the tick.
-    const out = composed?.data?.stories?.length ?? 0;
-    console.log(
-      `[digest] brief filter drops user=${userId} ` +
-        `sensitivity=${candidate.sensitivity ?? 'high'} ` +
-        `variant=${candidate.variant ?? 'full'} ` +
-        `outcome=${composed ? 'shipped' : 'rejected'} ` +
-        `in=${dropStats.in} ` +
-        `dropped_severity=${dropStats.severity} ` +
-        `dropped_url=${dropStats.url} ` +
-        `dropped_headline=${dropStats.headline} ` +
-        `dropped_shape=${dropStats.shape} ` +
-        `dropped_cap=${dropStats.cap} ` +
-        `out=${out}`,
-    );
-
-    if (composed) {
-      envelope = composed;
-      chosenVariant = candidate.variant;
-      chosenCandidate = candidate;
-      break;
+    synthesis = result.synthesis;
+    synthesisLevel = result.level;
+    // Public synthesis — parallel call. Profile-stripped; cache-
+    // shared across all users for the same (date, sensitivity,
+    // story-pool). Captures the FULL prose object (lead + signals +
+    // threads) since each personalised counterpart in the envelope
+    // can carry profile bias and the public surface needs sibling
+    // safe-versions of all three. Failure is non-fatal — the
+    // renderer's public-mode fail-safes (omit pull-quote / omit
+    // signals page / category-derived threads stub) handle absence
+    // rather than leaking the personalised version.
+    try {
+      const pub = await generateDigestProsePublic(winnerStories, sensitivity, briefLlmDeps);
+      if (pub) publicLead = pub;  // { lead, threads, signals, rankedStoryHashes }
+    } catch (err) {
+      console.warn(`[digest] brief: publicLead generation failed for ${userId}:`, err?.message);
     }
   }
 
+  // Compose envelope with synthesis pre-baked. The composer applies
+  // rankedStoryHashes-aware ordering BEFORE the cap, so the model's
+  // editorial judgment of importance survives MAX_STORIES_PER_USER.
+  const dropStats = { severity: 0, headline: 0, url: 0, shape: 0, cap: 0, in: winnerStories.length };
+  const envelope = composeBriefFromDigestStories(
+    winner.rule,
+    winnerStories,
+    insightsNumbers,
+    {
+      nowMs,
+      onDrop: (ev) => { dropStats[ev.reason] = (dropStats[ev.reason] ?? 0) + 1; },
+      synthesis: synthesis || publicLead
+        ? {
+            ...(synthesis ?? {}),
+            publicLead: publicLead?.lead ?? undefined,
+            publicSignals: publicLead?.signals ?? undefined,
+            publicThreads: publicLead?.threads ?? undefined,
+          }
+        : undefined,
+    },
+  );
+
+  // Per-attempt filter-drop line for the winning candidate. Same
+  // shape today's log emits — operators can keep their existing
+  // queries. The `due` field is new; legacy parsers ignore unknown
+  // fields.
+  const out = envelope?.data?.stories?.length ?? 0;
+  console.log(
+    `[digest] brief filter drops user=${userId} ` +
+      `sensitivity=${sensitivity} ` +
+      `variant=${winner.rule.variant ?? 'full'} ` +
+      `due=${winner.due} ` +
+      `outcome=${envelope ? 'shipped' : 'rejected'} ` +
+      `in=${dropStats.in} ` +
+      `dropped_severity=${dropStats.severity} ` +
+      `dropped_url=${dropStats.url} ` +
+      `dropped_headline=${dropStats.headline} ` +
+      `dropped_shape=${dropStats.shape} ` +
+      `dropped_cap=${dropStats.cap} ` +
+      `out=${out}`,
+  );
+
   if (!envelope) return null;
 
-  // Phase 3b — LLM enrichment. Substitutes the stubbed whyMatters /
-  // lead / threads / signals fields with Gemini 2.5 Flash output.
-  // Pure passthrough on any failure: the baseline envelope has
-  // already passed validation and is safe to ship as-is. Do NOT
-  // abort composition if the LLM is down; the stub is better than
-  // no brief.
-  if (BRIEF_LLM_ENABLED && chosenCandidate) {
-    const baseline = envelope;
+  // Per-story whyMatters enrichment. The synthesis is already in the
+  // envelope; this pass only fills per-story rationales. Failures
+  // fall through cleanly — the stub `whyMatters` from the composer
+  // is acceptable.
+  let finalEnvelope = envelope;
+  if (BRIEF_LLM_ENABLED) {
     try {
-      const enriched = await enrichBriefEnvelopeWithLLM(envelope, chosenCandidate, briefLlmDeps);
+      const enriched = await enrichBriefEnvelopeWithLLM(envelope, winner.rule, briefLlmDeps);
       // Defence in depth: re-validate the enriched envelope against
       // the renderer's strict contract before we SETEX it. If
       // enrichment produced a structurally broken shape (bad cache
       // row, code bug, upstream type drift) we'd otherwise SETEX it
       // and /api/brief would 404 the user's brief at read time. Fall
-      // back to the unenriched baseline — which is already known to
+      // back to the unenriched envelope — which is already known to
       // pass assertBriefEnvelope() because composeBriefFromDigestStories
       // asserted on construction.
       try {
         assertBriefEnvelope(enriched);
-        envelope = enriched;
+        finalEnvelope = enriched;
       } catch (assertErr) {
-        console.warn(`[digest] brief: enriched envelope failed assertion for ${userId} — shipping stubbed:`, assertErr?.message);
-        envelope = baseline;
+        console.warn(`[digest] brief: enriched envelope failed assertion for ${userId} — shipping unenriched:`, assertErr?.message);
       }
     } catch (err) {
-      console.warn(`[digest] brief: LLM enrichment threw for ${userId} — shipping stubbed envelope:`, err?.message);
-      envelope = baseline;
+      console.warn(`[digest] brief: per-story enrichment threw for ${userId} — shipping unenriched envelope:`, err?.message);
     }
   }
 
@@ -1400,7 +1503,7 @@ async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, 
   // produce envelope.data.date guarantees the slot's date portion
   // matches the displayed date. Two same-day compose runs produce
   // distinct slots so each digest dispatch freezes its own URL.
-  const briefTz = chosenCandidate?.digestTimezone ?? 'UTC';
+  const briefTz = winner.rule?.digestTimezone ?? 'UTC';
   const issueSlot = issueSlotInTz(nowMs, briefTz);
   const key = `brief:${userId}:${issueSlot}`;
   // The latest-pointer lets readers (dashboard panel, share-url
@@ -1409,7 +1512,7 @@ async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, 
   const latestPointerKey = `brief:latest:${userId}`;
   const latestPointerValue = JSON.stringify({ issueSlot });
   const pipelineResult = await redisPipeline([
-    ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(envelope)],
+    ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(finalEnvelope)],
     ['SETEX', latestPointerKey, String(BRIEF_TTL_SECONDS), latestPointerValue],
   ]);
   if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length < 2) {
@@ -1427,7 +1530,15 @@ async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, 
     baseUrl: WORLDMONITOR_PUBLIC_BASE_URL,
     secret: BRIEF_URL_SIGNING_SECRET,
   });
-  return { envelope, magazineUrl, chosenVariant };
+  return {
+    envelope: finalEnvelope,
+    magazineUrl,
+    chosenVariant: winner.rule.variant,
+    // synthesisLevel goes here — NOT in the envelope (renderer's
+    // assertNoExtraKeys would reject it). Read by the send loop for
+    // the email subject-line ternary and the parity log.
+    synthesisLevel,
+  };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -1522,14 +1633,10 @@ async function main() {
     if (!rule.userId || !rule.variant) continue;
 
     const lastSentKey = `digest:last-sent:v1:${rule.userId}:${rule.variant}`;
-    let lastSentAt = null;
-    try {
-      const raw = await upstashRest('GET', lastSentKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        lastSentAt = typeof parsed.sentAt === 'number' ? parsed.sentAt : null;
-      }
-    } catch { /* first send */ }
+    // Reuse the same getLastSentAt helper the compose pass used so
+    // the two flows agree on lastSentAt for every rule. Codex Round-3
+    // High #1 — winner-from-due-candidates pre-condition.
+    const lastSentAt = await getLastSentAt(rule);
 
     if (!isDue(rule, lastSentAt)) continue;
 
@@ -1539,7 +1646,7 @@ async function main() {
       continue;
     }
 
-    const windowStart = lastSentAt ?? (nowMs - DIGEST_LOOKBACK_MS);
+    const windowStart = digestWindowStartMs(lastSentAt, nowMs, DIGEST_LOOKBACK_MS);
     const stories = await buildDigest(rule, windowStart);
     if (!stories) {
       console.log(`[digest] No stories in window for ${rule.userId} (${rule.variant})`);
@@ -1570,27 +1677,57 @@ async function main() {
       continue;
     }
 
-    let aiSummary = null;
+    // Per-rule synthesis: each due rule's channel body must be
+    // internally consistent (lead derived from THIS rule's pool, not
+    // some other rule's). For multi-rule users, the compose flow
+    // picked ONE winning rule for the magazine envelope, but the
+    // send-loop body for a non-winner rule needs ITS OWN lead — else
+    // the email leads with one pool's narrative while listing stories
+    // from another pool. Cache absorbs the cost: when this is the
+    // winning rule, generateDigestProse hits the cache row written
+    // during the compose pass (same userId/sensitivity/pool/ctx) and
+    // no extra LLM call fires.
+    //
+    // The magazineUrl still points at the winner's envelope — that
+    // surface is the share-worthy alpha and remains a single brief
+    // per user per slot. Channel-body lead vs magazine lead may
+    // therefore differ for non-winner rules; users on those rules
+    // see their own coherent email + a magazine that shows the
+    // winner's editorial. Acceptable trade-off given multi-rule
+    // users are rare and the `(userId, issueSlot)` URL contract
+    // can't represent multiple per-rule briefs without an
+    // architectural change to the URL signer + Redis key.
+    const brief = briefByUser.get(rule.userId);
+    let briefLead = null;
+    let synthesisLevel = 3;
     if (AI_DIGEST_ENABLED && rule.aiDigestEnabled !== false) {
-      aiSummary = await generateAISummary(stories, rule);
+      const ruleCtx = await buildSynthesisCtx(rule, nowMs);
+      const ruleResult = await runSynthesisWithFallback(
+        rule.userId,
+        stories,
+        rule.sensitivity ?? 'high',
+        ruleCtx,
+        briefLlmDeps,
+      );
+      briefLead = ruleResult.synthesis?.lead ?? null;
+      synthesisLevel = ruleResult.level;
     }
 
     const storyListPlain = formatDigest(stories, nowMs);
     if (!storyListPlain) continue;
     const htmlRaw = formatDigestHtml(stories, nowMs);
 
-    const brief = briefByUser.get(rule.userId);
     const magazineUrl = brief?.magazineUrl ?? null;
     const { text, telegramText, slackText, discordText } = buildChannelBodies(
       storyListPlain,
-      aiSummary,
+      briefLead,
       magazineUrl,
     );
-    const htmlWithSummary = injectEmailSummary(htmlRaw, aiSummary);
+    const htmlWithSummary = injectEmailSummary(htmlRaw, briefLead);
     const html = injectBriefCta(htmlWithSummary, magazineUrl);
 
     const shortDate = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(new Date(nowMs));
-    const subject = aiSummary ? `WorldMonitor Intelligence Brief — ${shortDate}` : `WorldMonitor Digest — ${shortDate}`;
+    const subject = subjectForBrief({ briefLead, synthesisLevel, shortDate });
 
     let anyDelivered = false;
 
@@ -1613,7 +1750,11 @@ async function main() {
       } else if (ch.channelType === 'email' && ch.email) {
         ok = await sendEmail(ch.email, subject, text, html);
       } else if (ch.channelType === 'webhook' && ch.webhookEnvelope) {
-        ok = await sendWebhook(rule.userId, ch.webhookEnvelope, stories, aiSummary);
+        // Webhook payload's `summary` field reads the canonical
+        // briefLead — same string the email exec block + magazine
+        // pull-quote use. Codex Round-1 Medium #6 (channel-scope
+        // parity).
+        ok = await sendWebhook(rule.userId, ch.webhookEnvelope, stories, briefLead);
       }
       if (ok) anyDelivered = true;
     }
@@ -1626,6 +1767,61 @@ async function main() {
       console.log(
         `[digest] Sent ${stories.length} stories to ${rule.userId} (${rule.variant}, ${rule.digestMode})`,
       );
+      // Parity observability. Gated on AI_DIGEST_ENABLED + per-rule
+      // aiDigestEnabled — without this guard, opt-out users (briefLead
+      // is intentionally null) trigger PARITY REGRESSION every tick
+      // (null !== '<envelope stub lead>'), flooding Sentry with
+      // false positives. Greptile P1 on PR #3396.
+      //
+      // Two distinct properties to track:
+      //
+      // 1. CHANNEL parity (load-bearing): for ONE send, every channel
+      //    body of THIS rule (email HTML + plain text + Telegram +
+      //    Slack + Discord + webhook) reads the same `briefLead`
+      //    string. Verifiable by code review (single variable threaded
+      //    everywhere); logged here as `exec_len` for telemetry.
+      //
+      // 2. WINNER parity (informational): when `winner_match=true`,
+      //    THIS rule is the same one the magazine envelope was
+      //    composed from — so channel lead == magazine lead (cache-
+      //    shared via generateDigestProse). When `winner_match=false`,
+      //    this is a non-winner rule send; channel lead reflects this
+      //    rule's pool while the magazine URL points at the winner's
+      //    editorial. Expected divergence, not a regression.
+      //
+      // PARITY REGRESSION fires only when winner_match=true AND the
+      // channel lead differs from the envelope lead (the canonical-
+      // synthesis cache row has drifted between compose and send
+      // passes — a real contract break).
+      if (AI_DIGEST_ENABLED && rule.aiDigestEnabled !== false) {
+        const envLead = brief?.envelope?.data?.digest?.lead ?? '';
+        const winnerVariant = brief?.chosenVariant ?? '';
+        const winnerMatch = winnerVariant === (rule.variant ?? 'full');
+        const channelsEqual = briefLead === envLead;
+        const publicLead = brief?.envelope?.data?.digest?.publicLead ?? '';
+        console.log(
+          `[digest] brief lead parity user=${rule.userId} ` +
+            `rule=${rule.variant ?? 'full'}:${rule.sensitivity ?? 'high'}:${rule.lang ?? 'en'} ` +
+            `winner_match=${winnerMatch} ` +
+            `synthesis_level=${synthesisLevel} ` +
+            `exec_len=${(briefLead ?? '').length} ` +
+            `brief_lead_len=${envLead.length} ` +
+            `channels_equal=${channelsEqual} ` +
+            `public_lead_len=${publicLead.length}`,
+        );
+        if (winnerMatch && !channelsEqual && briefLead && envLead) {
+          // Sentry alert candidate — winner_match=true means this rule
+          // composed the envelope, so its channel lead MUST match the
+          // envelope lead. Mismatch = canonical-synthesis cache drift
+          // or code regression. Logged loudly so Sentry's console-
+          // breadcrumb hook surfaces it without an explicit
+          // captureMessage call.
+          console.warn(
+            `[digest] PARITY REGRESSION user=${rule.userId} — winner-rule channel lead != envelope lead. ` +
+              `Investigate: cache drift between compose pass and send pass?`,
+          );
+        }
+      }
     }
   }
 
