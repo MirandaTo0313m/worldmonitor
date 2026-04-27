@@ -500,6 +500,7 @@ function shouldSuppressCspViolation(
   blockedURI: string,
   sourceFile: string,
   cspConnectSrcAllowsHttps: boolean,
+  firstPartyConvexHost: string | null,
 ): boolean {
   // Skip non-enforced violations (report-only from dual-CSP interaction).
   if (disposition && disposition !== 'enforce') return true;
@@ -511,15 +512,16 @@ function shouldSuppressCspViolation(
     } catch { /* scheme-only values like "blob" fall through */ }
   }
   // First-party Convex backend: corporate proxies / privacy extensions that mutate the
-  // page CSP (stripping bare `https:` from connect-src) cause Convex sync calls to be
-  // CSP-blocked even though our policy allows them. Suppress unconditionally for the
-  // *.convex.cloud host so we don't drown Sentry in 1M+ events/month from those users
-  // (WORLDMONITOR-HN). Real first-party CSP regressions on this host are caught by the
-  // staging deploy + uptime check, not by user CSP-violation reports.
-  if (directive === 'connect-src') {
+  // page CSP (stripping bare `https:` from connect-src) cause our Convex sync calls to
+  // be CSP-blocked even though our policy allows them. Suppress unconditionally for OUR
+  // configured Convex deployment hostname (`VITE_CONVEX_URL`) so we don't drown Sentry
+  // in 1M+ events/month from those users (WORLDMONITOR-HN). Convex is multi-tenant —
+  // do NOT suppress all `*.convex.cloud`, that would silently swallow blocks to foreign/
+  // attacker-controlled Convex projects. Match by exact hostname only. Real first-party
+  // CSP regressions on this host are caught by the staging deploy + uptime check.
+  if (directive === 'connect-src' && firstPartyConvexHost) {
     try {
-      const host = new URL(blockedURI).hostname;
-      if (/\.convex\.cloud$/.test(host)) return true;
+      if (new URL(blockedURI).hostname === firstPartyConvexHost) return true;
     } catch { /* scheme-only values fall through */ }
   }
   // YouTube IFrame API loader: explicitly allowed by our script-src
@@ -582,6 +584,16 @@ const _cspAllowsHttps = (() => {
   if (!metaEl) return false;
   return metaAllows;
 })();
+// Resolve our configured Convex deployment hostname once. Convex is multi-tenant —
+// the CSP filter must scope its first-party suppression to OUR specific hostname,
+// not all *.convex.cloud, otherwise blocks to foreign/attacker tenants get silently
+// dropped too. Returns null when the env var is missing (dev/test); the filter
+// then leaves connect-src violations to fall through to the next rule.
+const _firstPartyConvexHost = ((): string | null => {
+  const url = import.meta.env.VITE_CONVEX_URL;
+  if (typeof url !== 'string' || url.length === 0) return null;
+  try { return new URL(url).hostname; } catch { return null; }
+})();
 // @ts-ignore — expose for tests
 window.__shouldSuppressCspViolation = shouldSuppressCspViolation;
 
@@ -595,6 +607,7 @@ window.addEventListener('securitypolicyviolation', (e) => {
     blocked,
     e.sourceFile ?? '',
     _cspAllowsHttps,
+    _firstPartyConvexHost,
   )) return;
   Sentry.captureMessage(`CSP: ${e.effectiveDirective} blocked ${blocked || '(inline)'}`, {
     level: 'warning',

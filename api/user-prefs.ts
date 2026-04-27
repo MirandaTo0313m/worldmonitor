@@ -66,10 +66,20 @@ export default async function handler(
       return jsonResponse(prefs ?? null, 200, cors);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // UNAUTHENTICATED leaks here when the Clerk token is valid for our API
-      // but Convex rejects it (audience drift, JWT issuer mismatch). Surface as
-      // 401 so the client clears credentials instead of treating it as 500.
+      // UNAUTHENTICATED on this path means the Clerk token PASSED our edge's
+      // `validateBearerToken` but Convex still rejected it — i.e. genuine
+      // auth/audience/issuer drift between our Clerk JWKS validation and
+      // Convex's auth config (a Clerk JWKS rotation lag, an audience mismatch,
+      // a stale CLERK_JWT_ISSUER_DOMAIN env var). User-bad-token cases are
+      // caught earlier (the `validateBearerToken` 401 above) and never reach
+      // this catch. Capture before returning 401 so the drift surfaces under
+      // a stable Sentry bucket instead of silently 401'ing every request.
       if (msg.includes('UNAUTHENTICATED')) {
+        console.error('[user-prefs] GET convex auth drift:', err);
+        captureSilentError(err, buildSentryContext(err, msg, {
+          method: 'GET', convexFn: 'userPreferences:getPreferences',
+          userId: session.userId, variant, ctx,
+        }));
         return jsonResponse({ error: 'UNAUTHENTICATED' }, 401, cors);
       }
       console.error('[user-prefs] GET error:', err);
@@ -115,6 +125,17 @@ export default async function handler(
       return jsonResponse({ error: 'BLOB_TOO_LARGE' }, 400, cors);
     }
     if (msg.includes('UNAUTHENTICATED')) {
+      // See GET branch above — UNAUTHENTICATED here means Clerk-vs-Convex
+      // auth drift (token already passed validateBearerToken). Capture
+      // before returning 401 so the drift is visible.
+      console.error('[user-prefs] POST convex auth drift:', err);
+      captureSilentError(err, buildSentryContext(err, msg, {
+        method: 'POST', convexFn: 'userPreferences:setPreferences',
+        userId: session.userId, variant: body.variant, ctx,
+        schemaVersion: typeof body.schemaVersion === 'number' ? body.schemaVersion : null,
+        expectedSyncVersion: body.expectedSyncVersion,
+        blobSize: body.data !== undefined ? JSON.stringify(body.data).length : 0,
+      }));
       return jsonResponse({ error: 'UNAUTHENTICATED' }, 401, cors);
     }
     console.error('[user-prefs] POST error:', err);
@@ -163,7 +184,11 @@ function buildSentryContext(
   const errName = err instanceof Error ? err.name : 'unknown';
   const requestIdMatch = msg.match(/\[Request ID:\s*([a-f0-9]+)\]/i);
   const convexRequestId = requestIdMatch?.[1];
-  const errorShape = /\[Request ID:\s*[a-f0-9]+\]\s*Server Error/i.test(msg) ? 'convex_server_error'
+  // Order matters: UNAUTHENTICATED is more specific than the request-id
+  // server-error shape and must be checked first. Auth drift is its own bucket
+  // so it groups separately from genuine Convex 5xx in the Sentry dashboard.
+  const errorShape = /UNAUTHENTICATED/.test(msg) ? 'convex_auth_drift'
+    : /\[Request ID:\s*[a-f0-9]+\]\s*Server Error/i.test(msg) ? 'convex_server_error'
     : /timeout|timed out|aborted/i.test(msg) ? 'transport_timeout'
     : /fetch failed|network|ECONN|ENOTFOUND|getaddrinfo/i.test(msg) ? 'transport_network'
     : 'unknown';
