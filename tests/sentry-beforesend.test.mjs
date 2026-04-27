@@ -219,7 +219,7 @@ describe('dynamic-module-import failures (stale chunk after deploy)', () => {
 
   for (const msg of dynamicImportErrors) {
     it(`suppresses "${msg.slice(0, 60)}..." with empty stack`, () => {
-      const event = makeEvent(msg, msg.startsWith('TypeError:') ? 'TypeError' : 'TypeError', []);
+      const event = makeEvent(msg, 'TypeError', []);
       assert.equal(beforeSend(event), null, `"${msg}" with empty stack should be suppressed (chunk-reload guard handles it)`);
     });
 

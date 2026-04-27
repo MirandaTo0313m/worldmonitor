@@ -177,7 +177,9 @@ function buildSentryContext(
       ...(convexRequestId ? { convex_request_id: convexRequestId } : {}),
       // Skip the minified `errName` (e.g. 'I') — it's noise, not signal — but
       // keep meaningful names like ConvexError / TypeError / SyntaxError.
-      ...(errName !== 'unknown' && errName !== 'Error' && errName.length > 2
+      // `> 1` is the minimal guard for single-character noise; all real built-in
+      // error class names are well above that.
+      ...(errName !== 'unknown' && errName !== 'Error' && errName.length > 1
         ? { error_name: errName }
         : {}),
     },
