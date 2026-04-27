@@ -584,6 +584,12 @@ async function buildResilienceScore(
     dataVersion,
     pillars,
     schemaVersion: '2.0',
+    // Plan 2026-04-26-002 §U3 (PR 2) — populate `true` for every country.
+    // PR 6 / §U7 swaps to `coverage >= 0.65 && (population >= 200k ||
+    // coverage >= 0.85) && !lowConfidence`. The field exists from PR 2
+    // onward so downstream readers can begin consuming it (informational
+    // only) before the gate logic flips.
+    headlineEligible: true,
   };
 }
 
@@ -639,6 +645,10 @@ export async function ensureResilienceScoreCached(countryCode: string, reader?: 
       // helper into a code path that has no domains to walk.
       pillars: [],
       schemaVersion: '1.0',
+      // Plan §U3: invalid country code → not headline-eligible (the
+      // PR 6 logic requires a real country first; the pre-PR-6 default
+      // of `true` does not apply to the empty-country fallback).
+      headlineEligible: false,
     };
   }
 
@@ -688,6 +698,11 @@ export async function ensureResilienceScoreCached(countryCode: string, reader?: 
         dataVersion: '',
         pillars: [],
         schemaVersion: '1.0',
+        // Plan §U3: missing-cache fallback → not headline-eligible. A
+        // country without a successful score build can't make the
+        // PR 6 coverage gate either, so the conservative default is
+        // false even during the PR-2 "true-by-default" window.
+        headlineEligible: false,
       };
 
   const scoreInterval = await readScoreInterval(normalizedCountryCode);
@@ -819,6 +834,8 @@ export function buildRankingItem(
       lowConfidence: true,
       overallCoverage: 0,
       rankStable: false,
+      // Plan §U3: missing-score fallback → not headline-eligible.
+      headlineEligible: false,
     };
   }
 
@@ -829,6 +846,11 @@ export function buildRankingItem(
     lowConfidence: response.lowConfidence,
     overallCoverage: computeOverallCoverage(response),
     rankStable: isRankStable(interval),
+    // Plan 2026-04-26-002 §U3 (PR 2) — pass through the field from the
+    // source-of-truth score response. PR 6 / §U7 swaps response.
+    // headlineEligible to actual eligibility logic; ranking item passes
+    // it through unchanged.
+    headlineEligible: response.headlineEligible,
   };
 }
 
