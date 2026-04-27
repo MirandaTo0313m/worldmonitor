@@ -154,6 +154,49 @@ describe('CSP violation filter (shouldSuppressCspViolation)', () => {
     });
   });
 
+  describe('first-party infrastructure (mutated user CSP)', () => {
+    // Corporate proxies / privacy extensions strip bare `https:` from connect-src in
+    // the user's effective policy, blocking our first-party Convex backend even though
+    // our policy allows it. Suppress unconditionally for known infra hosts so we don't
+    // drown Sentry in events from those users (WORLDMONITOR-HN).
+    it('suppresses connect-src to *.convex.cloud regardless of cspAllowsHttps', () => {
+      assert.ok(suppress('enforce', 'connect-src', 'https://tacit-curlew-777.convex.cloud/api/1.34.0/sync', '', false));
+    });
+
+    it('suppresses connect-src to *.convex.cloud subdomains', () => {
+      assert.ok(suppress('enforce', 'connect-src', 'https://abc-def-123.convex.cloud/api/x', '', false));
+    });
+
+    it('does NOT suppress connect-src to non-convex domains masquerading as convex.cloud-suffix', () => {
+      assert.ok(!suppress('enforce', 'connect-src', 'https://convex.cloud.evil.com/api', '', false));
+    });
+
+    it('suppresses script-src-elem for YouTube IFrame API loader', () => {
+      assert.ok(suppress('enforce', 'script-src-elem', 'https://www.youtube.com/iframe_api', '', false));
+    });
+
+    it('suppresses script-src-elem for YouTube IFrame API with cache-buster', () => {
+      assert.ok(suppress('enforce', 'script-src-elem', 'https://www.youtube.com/iframe_api?ver=1', '', false));
+    });
+
+    it('suppresses script-src for YouTube IFrame API loader (browser-variant directive)', () => {
+      assert.ok(suppress('enforce', 'script-src', 'https://www.youtube.com/iframe_api', '', false));
+    });
+
+    it('does NOT suppress other youtube.com paths under script-src-elem', () => {
+      assert.ok(!suppress('enforce', 'script-src-elem', 'https://www.youtube.com/embed/abc', '', false));
+    });
+
+    it('suppresses frame-src for Zscaler corporate proxy injection', () => {
+      assert.ok(suppress('enforce', 'frame-src', 'https://gateway.zscloud.net/auth/sso', '', false));
+    });
+
+    it('does NOT suppress connect-src to Zscaler (only frame-src is the injection)', () => {
+      // Cleared by the bare `https:` connect-src case if cspConnectSrcAllowsHttps; otherwise should pass through
+      assert.ok(!suppress('enforce', 'connect-src', 'https://gateway.zscloud.net/api', '', false));
+    });
+  });
+
   describe('real violations pass through', () => {
     it('reports third-party script-src violation', () => {
       assert.ok(!suppress('enforce', 'script-src', 'https://evil.com/crypto-miner.js', '', true));

@@ -78,6 +78,12 @@ function buildEnvelope(err, ctx, runtimeCfg) {
     },
     tags: { surface: 'api', runtime: runtimeCfg.runtime, ...(ctx?.tags ?? {}) },
     extra: ctx?.extra,
+    // Caller-supplied fingerprint overrides Sentry's default grouping.
+    // Use when the error message contains a high-cardinality token (request id,
+    // ephemeral hash) that would otherwise split one logical issue into many.
+    ...(Array.isArray(ctx?.fingerprint) && ctx.fingerprint.length > 0
+      ? { fingerprint: ctx.fingerprint }
+      : {}),
   };
 
   // Envelope format: header line, item header line, item payload line.
