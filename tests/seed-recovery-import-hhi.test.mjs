@@ -233,8 +233,16 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
       return r;
     };
   }
-  function restoreFetch() {
+  function restoreAll(mod) {
+    // Reviewer P2 (PR #3487 round 2): the prior `restoreFetch` form
+    // didn't reset the module's sleep override, so any test added
+    // AFTER this describe block would silently inherit the no-op
+    // sleep stub. Reset both globals to keep the module-level state
+    // hygienic across test files.
     globalThis.fetch = originalFetch;
+    if (mod && typeof mod.__setSleepForTests === 'function') {
+      mod.__setSleepForTests(null);
+    }
   }
 
   function makeJsonResponse(status, body) {
@@ -246,7 +254,9 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
 
   // Async import inside each test so the mock is in place when the
   // module-internal `_retrySleep` shortcut is honored. Using
-  // __setSleepForTests below to make the test deterministic + fast.
+  // __setSleepForTests below to make the test deterministic + fast;
+  // every test must `restoreAll(mod)` in its finally block to reset
+  // the sleep stub before the next test runs.
   async function loadFixture() {
     const mod = await import('../scripts/seed-recovery-import-hhi.mjs');
     mod.__setSleepForTests(async () => {});
@@ -266,7 +276,7 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
       assert.equal(result.records.length, 0, 'no records when rate-limited out');
       assert.equal(fetchCalls.length, 3, 'must attempt exactly 3 times');
     } finally {
-      restoreFetch();
+      restoreAll(mod);
     }
   });
 
@@ -287,7 +297,7 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
       assert.equal(result.year, 2023);
       assert.equal(fetchCalls.length, 3, 'two 429s + one 200 = 3 attempts');
     } finally {
-      restoreFetch();
+      restoreAll(mod);
     }
   });
 
@@ -307,7 +317,7 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
       assert.equal(init.headers['Ocp-Apim-Subscription-Key'], 'super-secret-key',
         'API key must arrive in the Ocp-Apim-Subscription-Key header');
     } finally {
-      restoreFetch();
+      restoreAll(mod);
     }
   });
 
@@ -320,7 +330,7 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
       assert.equal(url.searchParams.get('maxRecords'), '250000',
         'maxRecords must be 250000 (mirrors seed-recovery-reexport-share PR #3385)');
     } finally {
-      restoreFetch();
+      restoreAll(mod);
     }
   });
 
@@ -349,7 +359,7 @@ describe('seed-recovery-import-hhi — fetch retry hardening (U1, plan v19)', ()
         `231 partners with varied values → HHI in low range; got ${hhi.hhi}`);
       assert.equal(hhi.partnerCount, 231);
     } finally {
-      restoreFetch();
+      restoreAll(mod);
     }
   });
 });

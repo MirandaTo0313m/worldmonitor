@@ -173,8 +173,8 @@ export async function fetchImportsForReporter(reporterCode, apiKey) {
     const isTransient = isTransientComtrade(resp.status);
     if (!isRateLimit && !isTransient) break;
     if (attempt === MAX_ATTEMPTS) break;
-    // 429 → 2s, 4s; transient 5xx → 5s, 10s. Pick the larger of the
-    // two so a post-429 5xx still gets the right wait.
+    // 429 → 2s, 4s; transient 5xx → 5s, 10s. Backoff scales with
+    // attempt so later retries wait longer regardless of error type.
     const backoffMs = isRateLimit ? 2000 * attempt : 5000 * attempt;
     if (IMPORT_HHI_VERBOSE) {
       console.warn(`  [verbose] reporter=${reporterCode} attempt=${attempt}/${MAX_ATTEMPTS} status=${resp.status} backoff=${backoffMs}ms`);
