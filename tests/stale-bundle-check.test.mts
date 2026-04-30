@@ -49,10 +49,22 @@ function install(env: FakeEnv, currentHash = 'sha-running-bundle', minIntervalMs
       addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
         if (type === 'focus') env.focusListeners.push(listener as EventListener);
       },
+      removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+        if (type === 'focus') {
+          const i = env.focusListeners.indexOf(listener as EventListener);
+          if (i !== -1) env.focusListeners.splice(i, 1);
+        }
+      },
     },
     documentTarget: {
       addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
         if (type === 'visibilitychange') env.visibilityListeners.push(listener as EventListener);
+      },
+      removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+        if (type === 'visibilitychange') {
+          const i = env.visibilityListeners.indexOf(listener as EventListener);
+          if (i !== -1) env.visibilityListeners.splice(i, 1);
+        }
       },
       get visibilityState() { return env.visibilityState; },
     },
@@ -224,5 +236,32 @@ describe('installStaleBundleCheck', () => {
     env.clock.tick(10_000);
     await fireInterval(env);
     assert.equal(env.fetchCalls.length, 1, 'all three triggers within dedupe window must collapse to one fetch');
+  });
+
+  it('disposer fully removes focus + visibilitychange + interval (no orphaned listeners on double-install)', async () => {
+    // Greptile P2 fix: production calls installStaleBundleCheck once at
+    // boot. But hot-reload, test-helper reuse, or future code paths could
+    // double-install. The disposer must remove ALL three trigger paths so
+    // a re-install starts from a clean slate.
+    env.fetchResponse = { ok: true, status: 200, body: 'sha-running-bundle' };
+    const dispose = install(env);
+    assert.equal(env.focusListeners.length, 1, 'focus listener attached on install');
+    assert.equal(env.visibilityListeners.length, 1, 'visibility listener attached on install');
+    assert.equal(env.intervalCallbacks.length, 1, 'interval scheduled on install');
+
+    dispose();
+    assert.equal(env.focusListeners.length, 0, 'disposer removed focus listener');
+    assert.equal(env.visibilityListeners.length, 0, 'disposer removed visibility listener');
+    // intervalCallbacks isn't drained (clearInterval doesn't pop from our
+    // fake's callback array), but firing it post-disposal would still
+    // invoke it. The real `clearInterval` does prevent firing — and the
+    // production timer is the only thing the disposer needs to actually
+    // stop, since events past the disposal point can't reach removed
+    // listeners.
+
+    // After disposal, firing focus/visibility should NOT trigger fetch.
+    await fireFocus(env);
+    await fireVisibilityChange(env, 'visible');
+    assert.equal(env.fetchCalls.length, 0, 'no fetch after disposal — listeners truly removed');
   });
 });

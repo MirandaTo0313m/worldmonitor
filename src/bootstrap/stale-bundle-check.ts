@@ -15,10 +15,12 @@
 
 interface EventTargetLike {
   addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
 }
 
 interface DocumentLike {
   addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
   visibilityState?: string;
 }
 
@@ -135,18 +137,22 @@ export function installStaleBundleCheck(options: StaleBundleCheckOptions = {}): 
     }
   };
 
-  const handler: EventListener = () => {
+  const focusHandler: EventListener = () => {
     void check();
   };
-  eventTarget.addEventListener('focus', handler);
+  eventTarget.addEventListener('focus', focusHandler);
 
   // visibilitychange fires when the tab becomes visible again. We only
   // want to trigger on the visible side (not on hide), so gate with the
-  // documentTarget's visibilityState.
+  // documentTarget's visibilityState. Closure references documentTarget so
+  // the predicate uses the live state at fire time, not at install time.
+  const visibilityHandler: EventListener = documentTarget
+    ? () => {
+        if (documentTarget.visibilityState === 'visible') void check();
+      }
+    : () => {};
   if (documentTarget) {
-    documentTarget.addEventListener('visibilitychange', () => {
-      if (documentTarget.visibilityState === 'visible') void check();
-    });
+    documentTarget.addEventListener('visibilitychange', visibilityHandler);
   }
 
   // Periodic safety net for background tabs that never receive
@@ -154,9 +160,14 @@ export function installStaleBundleCheck(options: StaleBundleCheckOptions = {}): 
   const intervalHandle = setIntervalImpl(() => void check(), periodicIntervalMs);
 
   return () => {
-    // Test disposer — clear the periodic timer. Window/document listeners
-    // are unmanageable through our narrow EventTargetLike type, but tests
-    // pass spies and don't need explicit removal.
+    // Full cleanup. Production currently calls installStaleBundleCheck
+    // exactly once at boot, but a complete disposer protects against
+    // future hot-reload / test-helper reuse where double-install would
+    // otherwise leave orphaned listeners firing against stale targets.
+    eventTarget.removeEventListener('focus', focusHandler);
+    if (documentTarget) {
+      documentTarget.removeEventListener('visibilitychange', visibilityHandler);
+    }
     if (intervalHandle && typeof clearInterval === 'function') {
       clearInterval(intervalHandle as unknown as ReturnType<typeof setInterval>);
     }
