@@ -119,6 +119,38 @@ export default defineSchema({
     .index("by_user_variant", ["userId", "variant"])
     .index("by_enabled", ["enabled"]),
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Followed countries (watchlist primitive). See
+  // docs/plans/2026-05-02-001-feat-followed-countries-watchlist-primitive-plan.md
+  // (U12). One row per (userId, country) follow; uniqueness is enforced by
+  // the `followCountry` mutation via the `by_user_country` index check, NOT
+  // by Convex schema (Convex does not support unique constraints).
+  //
+  // `country` is a canonical ISO 3166-1 alpha-2 code (uppercase, e.g. "US",
+  // "GB", "JP"). Validation against the canonical alpha-2 registry happens
+  // at the mutation boundary (U13: `convex/lib/iso2.ts::isValidIso2`).
+  followedCountries: defineTable({
+    userId: v.string(),
+    country: v.string(),
+    addedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_country", ["country"])
+    .index("by_user_country", ["userId", "country"]),
+
+  // Aggregate-counter table for `countFollowers`. One row per country, kept
+  // in lockstep with `followedCountries` row inserts/deletes by the
+  // followCountry/unfollowCountry/mergeAnonymousLocal mutations (atomic
+  // patch within the same Convex mutation transaction). Lets the public
+  // `countFollowers` query be O(1) instead of O(n) per call. The privacy
+  // floor (`COUNTRY_COUNT_PRIVACY_FLOOR`) is applied at read time in the
+  // query, not at write time — the row stores the true count.
+  followedCountriesCounts: defineTable({
+    country: v.string(),
+    count: v.number(),
+    updatedAt: v.number(),
+  }).index("by_country", ["country"]),
+
   telegramPairingTokens: defineTable({
     userId: v.string(),
     token: v.string(),
