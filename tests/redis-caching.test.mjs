@@ -541,6 +541,61 @@ describe('cachedFetchJson inflight timeout (#3539)', { concurrency: 1 }, () => {
     }
   });
 
+  it('per-call opts.timeoutMs overrides the default ceiling', async () => {
+    const redis = await importRedisFresh();
+    const restoreEnv = withEnv({
+      UPSTASH_REDIS_REST_URL: 'https://redis.test',
+      UPSTASH_REDIS_REST_TOKEN: 'token',
+      VERCEL_ENV: undefined,
+      VERCEL_GIT_COMMIT_SHA: undefined,
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async (url) => {
+      const raw = String(url);
+      if (raw.includes('/get/')) return jsonResponse({ result: undefined });
+      if (raw.includes('/set/')) return jsonResponse({ result: 'OK' });
+      throw new Error(`Unexpected fetch URL: ${raw}`);
+    };
+
+    try {
+      // Default ceiling deliberately tiny; caller passes a much higher per-call
+      // budget, so a fetcher that runs 80ms should succeed. Without the
+      // override it would reject at 20ms.
+      redis.__setFetcherTimeoutForTests(20);
+
+      const result = await redis.cachedFetchJson(
+        'override:test:long',
+        60,
+        async () => {
+          await new Promise((r) => setTimeout(r, 80));
+          return { value: 'long-fetcher-allowed' };
+        },
+        undefined,
+        { timeoutMs: 500 },
+      );
+      assert.deepEqual(result, { value: 'long-fetcher-allowed' });
+
+      // Same shape for cachedFetchJsonWithMeta — opts.timeoutMs lives next to opts.usage.
+      const meta = await redis.cachedFetchJsonWithMeta(
+        'override:meta:long',
+        60,
+        async () => {
+          await new Promise((r) => setTimeout(r, 80));
+          return { value: 'meta-long-allowed' };
+        },
+        undefined,
+        { timeoutMs: 500 },
+      );
+      assert.equal(meta.source, 'fresh');
+      assert.deepEqual(meta.data, { value: 'meta-long-allowed' });
+    } finally {
+      redis.__resetFetcherTimeoutForTests();
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
   it('cachedFetchJsonWithMeta also enforces the inflight timeout', async () => {
     const redis = await importRedisFresh();
     const restoreEnv = withEnv({

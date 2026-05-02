@@ -251,29 +251,31 @@ export async function runRedisPipeline(
 const inflight = new Map<string, Promise<unknown>>();
 
 /**
- * Hard upper bound on how long a single fetcher may run before its inflight
- * entry is forced to settle (#3539).
+ * Default upper bound on how long a single fetcher may run before its
+ * inflight entry is forced to settle (#3539).
  *
  * Without this, a fetcher with no internal timeout (no AbortController, no
- * `fetch` `signal`) that truly never settles persists in the inflight Map for
- * the lifetime of the Vercel isolate — every subsequent caller for that key
- * gets handed the same unresolved promise, permanently poisoning the key.
+ * `fetch` `signal`) that truly never settles persists in the inflight Map
+ * for the lifetime of the Vercel isolate — every subsequent caller for that
+ * key gets handed the same unresolved promise, permanently poisoning it.
  *
- * 30s is well above any well-behaved upstream's UPSTREAM_TIMEOUT_MS budget
- * (typically 5–15s), so this only fires on a misbehaving fetcher. The cache
- * layer is the last line of defense; well-behaved callers never see it.
+ * 30s comfortably exceeds well-behaved HTTP fetchers (UPSTREAM_TIMEOUT_MS is
+ * typically 5–15s), so this only fires on misbehaving callers. Callers whose
+ * fetcher legitimately runs longer (LLM reasoning, multi-stage aggregations)
+ * MUST pass an explicit `opts.timeoutMs` set above their internal budget,
+ * otherwise the cache layer will pre-empt the caller's own timeout/fallback.
  */
 const FETCHER_TIMEOUT_MS_DEFAULT = 30_000;
-let fetcherTimeoutMs = FETCHER_TIMEOUT_MS_DEFAULT;
+let fetcherTimeoutDefaultMs = FETCHER_TIMEOUT_MS_DEFAULT;
 
-// Test-only: override the inflight timeout so unit tests can exercise the
-// timeout branch without sleeping for 30s. No production caller should ever
-// invoke this.
+// Test-only: override the DEFAULT inflight timeout so unit tests can exercise
+// the timeout branch without sleeping for 30s. Per-call `opts.timeoutMs` still
+// wins. No production caller should ever invoke this.
 export function __setFetcherTimeoutForTests(ms: number): void {
-  fetcherTimeoutMs = ms;
+  fetcherTimeoutDefaultMs = ms;
 }
 export function __resetFetcherTimeoutForTests(): void {
-  fetcherTimeoutMs = FETCHER_TIMEOUT_MS_DEFAULT;
+  fetcherTimeoutDefaultMs = FETCHER_TIMEOUT_MS_DEFAULT;
 }
 
 /**
@@ -282,12 +284,12 @@ export function __resetFetcherTimeoutForTests(): void {
  * cleared as soon as the fetcher wins so we don't leak handles or keep the
  * isolate awake unnecessarily.
  */
-function withFetcherTimeout<T>(promise: Promise<T>, key: string): Promise<T> {
+function withFetcherTimeout<T>(promise: Promise<T>, key: string, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`cachedFetchJson timeout after ${fetcherTimeoutMs}ms for "${key}"`));
-    }, fetcherTimeoutMs);
+      reject(new Error(`cachedFetchJson timeout after ${timeoutMs}ms for "${key}"`));
+    }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
@@ -295,18 +297,33 @@ function withFetcherTimeout<T>(promise: Promise<T>, key: string): Promise<T> {
 }
 
 /**
+ * Per-call cache-helper options.
+ *
+ * - `timeoutMs`: Hard upper bound on the fetcher. Defaults to 30s. Pass a
+ *   value above the caller's internal timeout (LLM `timeoutMs`, aggregated
+ *   `UPSTREAM_TIMEOUT_MS` sum) so the cache layer doesn't pre-empt the
+ *   caller's own bound. The cache safety net should be the LAST resort.
+ */
+export interface CachedFetchOpts {
+  timeoutMs?: number;
+}
+
+/**
  * Check cache, then fetch with coalescing on miss.
  * Concurrent callers for the same key share a single upstream fetch + Redis write.
  * When fetcher returns null, a sentinel is cached for negativeTtlSeconds to prevent request storms.
  *
- * The fetcher is force-rejected after FETCHER_TIMEOUT_MS_DEFAULT (#3539) so a
- * misbehaving fetcher cannot poison the inflight Map for the isolate lifetime.
+ * The fetcher is force-rejected after `opts.timeoutMs` (default 30s, #3539)
+ * so a misbehaving fetcher cannot poison the inflight Map for the isolate
+ * lifetime. Callers with legitimately long-running fetchers (LLM, multi-stage
+ * upstream aggregation) MUST pass `opts.timeoutMs` above their internal bound.
  */
 export async function cachedFetchJson<T extends object>(
   key: string,
   ttlSeconds: number,
   fetcher: () => Promise<T | null>,
   negativeTtlSeconds = 120,
+  opts?: CachedFetchOpts,
 ): Promise<T | null> {
   const cached = await getCachedJson(key);
   if (cached === NEG_SENTINEL) return null;
@@ -315,7 +332,8 @@ export async function cachedFetchJson<T extends object>(
   const existing = inflight.get(key);
   if (existing) return existing as Promise<T | null>;
 
-  const promise = withFetcherTimeout(fetcher(), key)
+  const timeoutMs = opts?.timeoutMs ?? fetcherTimeoutDefaultMs;
+  const promise = withFetcherTimeout(fetcher(), key, timeoutMs)
     .then(async (result) => {
       if (result != null) {
         await setCachedJson(key, result, ttlSeconds);
@@ -379,7 +397,7 @@ export async function cachedFetchJsonWithMeta<T extends object>(
   ttlSeconds: number,
   fetcher: () => Promise<T | null>,
   negativeTtlSeconds = 120,
-  opts?: { usage?: UsageHook },
+  opts?: { usage?: UsageHook; timeoutMs?: number },
 ): Promise<{ data: T | null; source: 'cache' | 'fresh' }> {
   const cached = await getCachedJson(key);
   if (cached === NEG_SENTINEL) return { data: null, source: 'cache' };
@@ -395,7 +413,8 @@ export async function cachedFetchJsonWithMeta<T extends object>(
   let upstreamStatus = 0;
   let cacheStatus: 'miss' | 'neg-sentinel' = 'miss';
 
-  const promise = withFetcherTimeout(fetcher(), key)
+  const timeoutMs = opts?.timeoutMs ?? fetcherTimeoutDefaultMs;
+  const promise = withFetcherTimeout(fetcher(), key, timeoutMs)
     .then(async (result) => {
       // Only count an upstream call as a 200 when it actually returned data.
       // A null result triggers the neg-sentinel branch below — these are
