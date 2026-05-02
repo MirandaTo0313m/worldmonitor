@@ -1,15 +1,16 @@
 import { ConvexError, v } from "convex/values";
-import { type MutationCtx, mutation } from "./_generated/server";
 import {
-  COUNTRY_COUNT_PRIVACY_FLOOR as _COUNTRY_COUNT_PRIVACY_FLOOR,
+  internalQuery,
+  type MutationCtx,
+  mutation,
+  query,
+} from "./_generated/server";
+import {
+  COUNTRY_COUNT_PRIVACY_FLOOR,
   FREE_TIER_FOLLOW_LIMIT,
   MAX_MERGE_INPUT,
 } from "./constants";
 import { isValidIso2 } from "./lib/iso2";
-
-// Acknowledge unused import (queries land in U14). Kept here so the
-// constant import is colocated with the rest of the module's surface.
-void _COUNTRY_COUNT_PRIVACY_FLOOR;
 
 /**
  * Layer-2 entitlement gate for the followed-countries watchlist primitive
@@ -368,3 +369,136 @@ function hashUserIdForLog(userId: string): string {
   // Convert to unsigned 32-bit hex for compact log readability.
   return (h >>> 0).toString(16).padStart(8, "0");
 }
+
+// ---------------------------------------------------------------------------
+// Queries (plan U14)
+// ---------------------------------------------------------------------------
+
+/**
+ * `listFollowed()` — auth'd reactive read of the current user's watchlist.
+ *
+ * Returns ONLY the country codes (string[]); `addedAt` and `userId` are
+ * not exposed to clients. Sorted by `addedAt` ascending (earliest-added
+ * first) so the client gets a stable, intuitive order — the country a
+ * user followed first appears first.
+ *
+ * If no auth identity is present, returns `[]` (consistent with
+ * `convex/alertRules.ts::getAlertRules`). Reactive: Convex will
+ * auto-resubscribe whenever the underlying `followedCountries` rows for
+ * this user change.
+ */
+export const listFollowed = query({
+  args: {},
+  handler: async (ctx): Promise<string[]> => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return [];
+    const rows = await ctx.db
+      .query("followedCountries")
+      .withIndex("by_user", (q) => q.eq("userId", identity.subject))
+      .collect();
+    // Sort by addedAt ascending — earliest-added first. Documented choice
+    // (plan U14 test scenario: PRO user with `['US','GB']` added in that
+    // order returns `['US','GB']`).
+    return rows
+      .sort((a, b) => a.addedAt - b.addedAt)
+      .map((r) => r.country);
+  },
+});
+
+/**
+ * `countFollowers({ country })` — public, no auth.
+ *
+ * O(1) read of the aggregate `followedCountriesCounts` row. Validates
+ * the input as canonical ISO-2 (rejects `INVALID`, `us`, `XX`, etc.)
+ * and returns the count.
+ *
+ * Privacy floor: counts strictly below `COUNTRY_COUNT_PRIVACY_FLOOR`
+ * are returned as `0` to public callers so a single follower can't be
+ * deanonymized via this endpoint. The unbucketed count is internally
+ * accessible to ops via direct DB reads on the
+ * `followedCountriesCounts` table — this floor only applies at the
+ * public-query layer.
+ */
+export const countFollowers = query({
+  args: { country: v.string() },
+  handler: async (ctx, args): Promise<number> => {
+    if (!isValidIso2(args.country)) {
+      throw new ConvexError({
+        kind: "INVALID_COUNTRY",
+        country: args.country,
+      });
+    }
+    const row = await ctx.db
+      .query("followedCountriesCounts")
+      .withIndex("by_country", (q) => q.eq("country", args.country))
+      .first();
+    const raw = row?.count ?? 0;
+    if (raw < COUNTRY_COUNT_PRIVACY_FLOOR) return 0;
+    return raw;
+  },
+});
+
+/**
+ * `listFollowersPage({ country, cursor, limit })` — INTERNAL-ONLY
+ * paginated cursor over the followers of a country.
+ *
+ * Declared via `internalQuery` (NOT `query`) so it never appears in
+ * `api.followedCountries` — only in `internal.followedCountries`. This
+ * is the privacy boundary: follower lists are never publicly readable.
+ *
+ * `limit` is clamped to `[1, 500]` defensively so a buggy/abusive
+ * caller can't request a 10k-element response.
+ *
+ * Returns `{ userIds, nextCursor }` where `nextCursor` is `null` when
+ * Convex's paginator reports `isDone`.
+ */
+export const listFollowersPage = internalQuery({
+  args: {
+    country: v.string(),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    limit: v.number(),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ userIds: string[]; nextCursor: string | null }> => {
+    if (!isValidIso2(args.country)) {
+      throw new ConvexError({
+        kind: "INVALID_COUNTRY",
+        country: args.country,
+      });
+    }
+    const clampedLimit = Math.max(1, Math.min(500, args.limit));
+    const result = await ctx.db
+      .query("followedCountries")
+      .withIndex("by_country", (q) => q.eq("country", args.country))
+      .paginate({ cursor: args.cursor ?? null, numItems: clampedLimit });
+    return {
+      userIds: result.page.map((r) => r.userId),
+      nextCursor: result.isDone ? null : result.continueCursor,
+    };
+  },
+});
+
+/**
+ * `internalListFollowedForUser({ userId })` — INTERNAL-ONLY helper
+ * used by the `/relay/followed-countries` HTTP action.
+ *
+ * The relay has no Clerk identity (it authenticates via the shared
+ * secret in the Authorization header), so it can't call the public
+ * `listFollowed`. This helper takes an explicit `userId` and returns
+ * the same `string[]` shape. Sorting matches `listFollowed`: by
+ * `addedAt` ascending.
+ */
+export const internalListFollowedForUser = internalQuery({
+  args: { userId: v.string() },
+  handler: async (ctx, args): Promise<string[]> => {
+    const rows = await ctx.db
+      .query("followedCountries")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .collect();
+    return rows
+      .sort((a, b) => a.addedAt - b.addedAt)
+      .map((r) => r.country);
+  },
+});
