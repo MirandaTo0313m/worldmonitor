@@ -995,11 +995,14 @@ export default defineConfig(({ mode }) => {
               return 'panels';
             }
             // Give lazy-loaded locale chunks a recognizable prefix so the
-            // service worker can exclude them from precache (en.json is
-            // statically imported into the main bundle).
-            const localeMatch = id.match(/\/locales\/(\w+)\.json$/);
-            if (localeMatch && localeMatch[1] !== 'en') {
-              return `locale-${localeMatch[1]}`;
+            // service worker can exclude them from precache. en.shell.json
+            // is statically imported (inlined into the main bundle); only
+            // en.rest.json and the other-language files become chunks. The
+            // dot in `en.rest` is rewritten so the chunk filename matches
+            // the SW's `/assets/locale-.*\.js/` regex above.
+            const localeMatch = id.match(/\/locales\/([a-z]+(?:\.[a-z]+)?)\.json$/);
+            if (localeMatch && localeMatch[1] !== 'en' && localeMatch[1] !== 'en.shell') {
+              return `locale-${localeMatch[1].replace('.', '-')}`;
             }
             return undefined;
           },
