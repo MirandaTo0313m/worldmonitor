@@ -94,7 +94,117 @@ const {
   WM_FOLLOWED_COUNTRIES_CHANGED,
   _setDepsForTests,
   _resetStateForTests,
+  _emitAuthStateForTests,
 } = svc;
+
+// ---------------------------------------------------------------------------
+// In-memory fake Convex client for signed-in tests
+// ---------------------------------------------------------------------------
+// Mirrors the relevant behaviour of `convex/followedCountries.ts` mutations
+// + listFollowed query so signed-in tests exercise the full Convex code
+// path without a real server.
+
+const FAKE_API = {
+  followedCountries: {
+    followCountry: 'fake:followCountry',
+    unfollowCountry: 'fake:unfollowCountry',
+    mergeAnonymousLocal: 'fake:mergeAnonymousLocal',
+    listFollowed: 'fake:listFollowed',
+  },
+};
+
+function makeFakeConvex({ tier, capLimit = 3 }) {
+  const rows = []; // {country, addedAt}
+  let listFollowedCb = null;
+  const fireSnapshot = () => {
+    if (!listFollowedCb) return;
+    const sorted = [...rows].sort((a, b) => a.addedAt - b.addedAt).map((r) => r.country);
+    listFollowedCb(sorted);
+  };
+  const ConvexErrorCtor = class extends Error {
+    constructor(data) {
+      super(`ConvexError: ${data.kind}`);
+      this.data = data;
+    }
+  };
+  const client = {
+    async mutation(ref, args) {
+      if (ref === FAKE_API.followedCountries.followCountry) {
+        const { country } = args;
+        if (rows.find((r) => r.country === country)) {
+          return { ok: true, idempotent: true };
+        }
+        if (tier < 1 && rows.length >= capLimit) {
+          throw new ConvexErrorCtor({ kind: 'FREE_CAP', currentCount: rows.length, limit: capLimit });
+        }
+        rows.push({ country, addedAt: Date.now() + rows.length });
+        fireSnapshot();
+        return { ok: true, idempotent: false };
+      }
+      if (ref === FAKE_API.followedCountries.unfollowCountry) {
+        const { country } = args;
+        const idx = rows.findIndex((r) => r.country === country);
+        if (idx === -1) return { ok: true, idempotent: true };
+        rows.splice(idx, 1);
+        fireSnapshot();
+        return { ok: true, idempotent: false };
+      }
+      if (ref === FAKE_API.followedCountries.mergeAnonymousLocal) {
+        const { countries } = args;
+        if (countries.length === 0) {
+          throw new ConvexErrorCtor({ kind: 'EMPTY_INPUT' });
+        }
+        const droppedInvalid = [];
+        const validInputs = [];
+        const ISO_RE = /^[A-Z]{2}$/;
+        for (const c of countries) {
+          if (typeof c === 'string' && ISO_RE.test(c)) validInputs.push(c);
+          else droppedInvalid.push(c);
+        }
+        const seen = new Set();
+        const canonical = [];
+        for (const c of validInputs) if (!seen.has(c)) { seen.add(c); canonical.push(c); }
+        const existingSet = new Set(rows.map((r) => r.country));
+        const newCandidates = canonical.filter((c) => !existingSet.has(c));
+        let accepted, droppedDueToCap;
+        if (tier < 1) {
+          const remaining = Math.max(0, capLimit - rows.length);
+          accepted = newCandidates.slice(0, remaining);
+          droppedDueToCap = newCandidates.slice(remaining);
+        } else {
+          accepted = newCandidates;
+          droppedDueToCap = [];
+        }
+        for (const country of accepted) {
+          rows.push({ country, addedAt: Date.now() + rows.length });
+        }
+        if (accepted.length > 0) fireSnapshot();
+        return {
+          totalCount: rows.length,
+          accepted,
+          droppedInvalid,
+          droppedDueToCap,
+        };
+      }
+      throw new Error(`unmocked mutation: ${ref}`);
+    },
+    onUpdate(ref, _args, onResult /* , onError */) {
+      if (ref === FAKE_API.followedCountries.listFollowed) {
+        listFollowedCb = onResult;
+        // Fire the initial snapshot synchronously after a microtask, mimicking Convex.
+        Promise.resolve().then(() => {
+          const sorted = [...rows].sort((a, b) => a.addedAt - b.addedAt).map((r) => r.country);
+          if (listFollowedCb === onResult) onResult(sorted);
+        });
+        return () => {
+          if (listFollowedCb === onResult) listFollowedCb = null;
+        };
+      }
+      throw new Error(`unmocked subscription: ${ref}`);
+    },
+  };
+  return { client, getRows: () => rows };
+}
 
 // Default deps for tests: anonymous user (Clerk null), entitlement null.
 function setAnonymous() {
@@ -103,25 +213,41 @@ function setAnonymous() {
     getEntitlementState: () => null,
     hasTier: () => false,
     featureFlagEnabled: true,
+    convexClient: null,
+    convexApi: null,
   });
 }
 
-function setSignedInPro() {
+async function setSignedInPro() {
+  const fake = makeFakeConvex({ tier: 1 });
   _setDepsForTests({
     getCurrentClerkUser: () => ({ id: 'user_pro' }),
     getEntitlementState: () => ({ features: { tier: 1 } }),
     hasTier: (n) => n <= 1,
     featureFlagEnabled: true,
+    convexClient: fake.client,
+    convexApi: FAKE_API,
   });
+  // Drive the handoff to 'complete' so legacy tests don't see HANDOFF_PENDING.
+  await _emitAuthStateForTests({ id: 'user_pro' });
+  // Allow the reactive subscription's initial-snapshot microtask to fire.
+  await new Promise((r) => setTimeout(r, 0));
+  return fake;
 }
 
-function setSignedInFreeLoaded() {
+async function setSignedInFreeLoaded() {
+  const fake = makeFakeConvex({ tier: 0 });
   _setDepsForTests({
     getCurrentClerkUser: () => ({ id: 'user_free' }),
     getEntitlementState: () => ({ features: { tier: 0 } }),
     hasTier: () => false,
     featureFlagEnabled: true,
+    convexClient: fake.client,
+    convexApi: FAKE_API,
   });
+  await _emitAuthStateForTests({ id: 'user_free' });
+  await new Promise((r) => setTimeout(r, 0));
+  return fake;
 }
 
 function setSignedInLoading() {
@@ -130,6 +256,8 @@ function setSignedInLoading() {
     getEntitlementState: () => null,
     hasTier: () => false,
     featureFlagEnabled: true,
+    convexClient: null,
+    convexApi: null,
   });
 }
 
@@ -263,7 +391,7 @@ describe('followed-countries service — STORAGE_FULL', () => {
 
 describe('followed-countries service — FREE_CAP', () => {
   it('signed-in free user at cap of 3: 4th add returns FREE_CAP, list unchanged', async () => {
-    setSignedInFreeLoaded();
+    await setSignedInFreeLoaded();
     assert.deepEqual(await addCountry('US'), { ok: true });
     assert.deepEqual(await addCountry('FR'), { ok: true });
     assert.deepEqual(await addCountry('DE'), { ok: true });
@@ -278,7 +406,7 @@ describe('followed-countries service — FREE_CAP', () => {
 
 describe('followed-countries service — PRO no cap', () => {
   it('PRO user can add 50 countries successfully', async () => {
-    setSignedInPro();
+    await setSignedInPro();
     const codes = [
       'US','GB','FR','DE','IT','ES','PT','NL','BE','CH',
       'AT','SE','NO','DK','FI','IS','IE','PL','CZ','HU',
