@@ -230,6 +230,16 @@ function isFeatureFlagEnabled(): boolean {
   }
 }
 
+/**
+ * Public read-only mirror of the internal feature-flag check. Exposed so
+ * UI helpers (e.g. FollowButton in U4) gate on the same source of truth
+ * — including the `_setDepsForTests({ featureFlagEnabled: ... })` override
+ * — instead of duplicating the `import.meta.env` parse.
+ */
+export function isFollowFeatureEnabled(): boolean {
+  return isFeatureFlagEnabled();
+}
+
 // ---------------------------------------------------------------------------
 // Storage I/O — anonymous mode
 // ---------------------------------------------------------------------------
