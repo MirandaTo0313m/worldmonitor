@@ -31,7 +31,7 @@
     "prebuild": "npm run build:openapi && npm run build:agent-skills && npm run build:i18n-shell",
     "build": "npm run build:blog && tsc && vite build",
     "build:sidecar-sebuf": "node scripts/build-sidecar-sebuf.mjs",
-    "build:desktop": "node scripts/build-sidecar-sebuf.mjs && node scripts/build-sidecar-handlers.mjs && tsc && vite build",
+    "build:desktop": "npm run build:i18n-shell && node scripts/build-sidecar-sebuf.mjs && node scripts/build-sidecar-handlers.mjs && tsc && vite build",
     "build:full": "npm run build:openapi && npm run build:agent-skills && npm run build:i18n-shell && npm run build:blog && cross-env-shell VITE_VARIANT=full \"tsc && vite build\"",
     "build:tech": "npm run build:openapi && npm run build:agent-skills && npm run build:i18n-shell && cross-env-shell VITE_VARIANT=tech \"tsc && vite build\"",
     "build:finance": "npm run build:openapi && npm run build:agent-skills && npm run build:i18n-shell && cross-env-shell VITE_VARIANT=finance \"tsc && vite build\"",
