@@ -190,25 +190,55 @@ export class RegionalIntelligenceBoard extends Panel {
       return;
     }
 
-    // If the requested region has no snapshot yet, try the other regions in
-    // parallel and render the first one with data. Better UX than telling
-    // the user to wait — they get something useful immediately and a small
-    // notice explaining we're showing a different region.
+    // If the requested region has no snapshot yet, race the other regions
+    // and render the FIRST one that returns data. Better UX than telling
+    // the user to wait — and we never block on a slow/hung region because
+    // (a) we resolve on the first non-empty success rather than waiting for
+    // all to settle, and (b) a hard timeout caps the total wait. The
+    // generated client has no default per-request timeout, so without both
+    // guards a single hung region could leave the panel on the loader.
     if (!snapshot?.regionId) {
       const fallbackIds = BOARD_REGIONS.map(r => r.id).filter(id => id !== myRegion);
-      const settled = await Promise.allSettled(
-        fallbackIds.map(id => client.getRegionalSnapshot({ regionId: id })),
-      );
-      if (!isLatestSequence(mySequence, this.latestSequence)) return;
-      for (let i = 0; i < settled.length; i++) {
-        const r = settled[i];
-        const id = fallbackIds[i];
-        if (r && id && r.status === 'fulfilled' && r.value.snapshot?.regionId) {
-          snapshot = r.value.snapshot;
-          actualRegion = id;
-          fallbackFrom = myRegion;
-          break;
+      const FALLBACK_TIMEOUT_MS = 4000;
+      const winner = await new Promise<{ snapshot: RegionalSnapshot; id: string } | null>(resolve => {
+        if (fallbackIds.length === 0) {
+          resolve(null);
+          return;
         }
+        let resolved = false;
+        let pending = fallbackIds.length;
+        const settle = (value: { snapshot: RegionalSnapshot; id: string } | null) => {
+          if (resolved) return;
+          resolved = true;
+          resolve(value);
+        };
+        const timer = setTimeout(() => settle(null), FALLBACK_TIMEOUT_MS);
+        for (const id of fallbackIds) {
+          client.getRegionalSnapshot({ regionId: id })
+            .then(resp => {
+              if (resp.snapshot?.regionId) {
+                clearTimeout(timer);
+                settle({ snapshot: resp.snapshot, id });
+                return;
+              }
+              if (--pending === 0) {
+                clearTimeout(timer);
+                settle(null);
+              }
+            })
+            .catch(() => {
+              if (--pending === 0) {
+                clearTimeout(timer);
+                settle(null);
+              }
+            });
+        }
+      });
+      if (!isLatestSequence(mySequence, this.latestSequence)) return;
+      if (winner) {
+        snapshot = winner.snapshot;
+        actualRegion = winner.id;
+        fallbackFrom = myRegion;
       }
     }
 
