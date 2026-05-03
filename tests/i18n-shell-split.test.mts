@@ -154,4 +154,40 @@ describe('i18n shell/rest split', () => {
       `${missing.length} leaf keys missing from merged shell+rest: ${missing.slice(0, 5).join(', ')}`,
     );
   });
+
+  it('REGRESSION (#3563 P1): shallow `{...shell, ...rest}` would clobber components — runtime merge MUST deep-merge components', () => {
+    // Pins the gotcha that motivated the loadEnFull() fix in src/services/i18n.ts.
+    // Both files have a top-level `components` key. A shallow spread drops the
+    // shell's components.panel/deckgl/map. This test documents the trap so
+    // future contributors don't "simplify" the runtime merge back to a shallow
+    // spread.
+    const shallow = { ...shell, ...rest } as Dict;
+    const shallowComponents = (shallow.components as Dict | undefined) ?? {};
+    assert.equal(
+      'panel' in shallowComponents,
+      false,
+      'shallow spread should drop shell.components.panel (proves the bug exists)',
+    );
+    assert.equal(
+      'deckgl' in shallowComponents,
+      false,
+      'shallow spread should drop shell.components.deckgl',
+    );
+    assert.equal(
+      'map' in shallowComponents,
+      false,
+      'shallow spread should drop shell.components.map',
+    );
+
+    // The runtime fix: shallow spread plus an explicit components-level merge.
+    const fixedComponents = {
+      ...((shell.components as Dict | undefined) ?? {}),
+      ...((rest.components as Dict | undefined) ?? {}),
+    };
+    const fixed: Dict = { ...shell, ...rest, components: fixedComponents };
+    const fixedC = fixed.components as Dict;
+    assert.ok('panel' in fixedC, 'runtime merge must preserve components.panel');
+    assert.ok('deckgl' in fixedC, 'runtime merge must preserve components.deckgl');
+    assert.ok('map' in fixedC, 'runtime merge must preserve components.map');
+  });
 });

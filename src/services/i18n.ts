@@ -43,7 +43,22 @@ function loadEnFull(): Promise<TranslationDictionary> {
   if (enFullPromise) return enFullPromise;
   enFullPromise = import('../locales/en.rest.json').then((mod) => {
     const rest = (mod.default ?? mod) as TranslationDictionary;
-    return { ...(enShell as TranslationDictionary), ...rest };
+    const shellDict = enShell as TranslationDictionary;
+    // Shallow spread is insufficient: `components` is a top-level key in
+    // BOTH shell (panel/deckgl/map) and rest (everything else), so a plain
+    // `{ ...shell, ...rest }` would clobber shell.components and silently
+    // drop panel/deckgl/map. Production was previously rescued by i18next
+    // deep-merging the shell-then-rest sequence at init, but the cached
+    // value here MUST itself be the full dict so direct readers and any
+    // future fresh-i18next paths stay correct.
+    const merged: TranslationDictionary = { ...shellDict, ...rest };
+    if (shellDict.components && rest.components) {
+      merged.components = {
+        ...(shellDict.components as Record<string, unknown>),
+        ...(rest.components as Record<string, unknown>),
+      };
+    }
+    return merged;
   });
   return enFullPromise;
 }
