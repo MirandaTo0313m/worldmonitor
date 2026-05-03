@@ -178,6 +178,8 @@ export class RegionalIntelligenceBoard extends Panel {
     // board's core render path. PR #2995 review: the old Promise.allSettled
     // approach blocked the entire panel on slow enrichment RPCs.
     let snapshot: RegionalSnapshot | undefined;
+    let actualRegion = myRegion;
+    let fallbackFrom: string | null = null;
     try {
       const resp = await client.getRegionalSnapshot({ regionId: myRegion });
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
@@ -186,6 +188,28 @@ export class RegionalIntelligenceBoard extends Panel {
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
       this.renderError(err instanceof Error ? err.message : String(err));
       return;
+    }
+
+    // If the requested region has no snapshot yet, try the other regions in
+    // parallel and render the first one with data. Better UX than telling
+    // the user to wait — they get something useful immediately and a small
+    // notice explaining we're showing a different region.
+    if (!snapshot?.regionId) {
+      const fallbackIds = BOARD_REGIONS.map(r => r.id).filter(id => id !== myRegion);
+      const settled = await Promise.allSettled(
+        fallbackIds.map(id => client.getRegionalSnapshot({ regionId: id })),
+      );
+      if (!isLatestSequence(mySequence, this.latestSequence)) return;
+      for (let i = 0; i < settled.length; i++) {
+        const r = settled[i];
+        const id = fallbackIds[i];
+        if (r && id && r.status === 'fulfilled' && r.value.snapshot?.regionId) {
+          snapshot = r.value.snapshot;
+          actualRegion = id;
+          fallbackFrom = myRegion;
+          break;
+        }
+      }
     }
 
     if (!snapshot?.regionId) {
@@ -199,13 +223,12 @@ export class RegionalIntelligenceBoard extends Panel {
     // the background enrichment RPCs resolve. Without null here, the default
     // undefined would render a false "No weekly brief available yet" while
     // the fetch is still in flight. PR #2995 review.
-    this.renderBoard(snapshot, null, null);
+    this.renderBoard(snapshot, null, null, fallbackFrom);
 
-    // Phase 2: fire history + brief RPCs in background. When they resolve,
-    // re-render with the enrichments appended — but only if this sequence
-    // is still current (user hasn't switched regions in the meantime).
-    const historyPromise = client.getRegimeHistory({ regionId: myRegion, limit: 20 }).catch(() => null);
-    const briefPromise = client.getRegionalBrief({ regionId: myRegion }).catch(() => null);
+    // Phase 2: fire history + brief RPCs in background. Use actualRegion so
+    // the enrichments match the rendered snapshot when we fell back.
+    const historyPromise = client.getRegimeHistory({ regionId: actualRegion, limit: 20 }).catch(() => null);
+    const briefPromise = client.getRegionalBrief({ regionId: actualRegion }).catch(() => null);
 
     Promise.allSettled([historyPromise, briefPromise]).then(([hResult, bResult]) => {
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
@@ -226,28 +249,41 @@ export class RegionalIntelligenceBoard extends Panel {
           ? bValue.brief   // undefined = no brief yet, RegionalBrief = render
           : null;          // null = RPC or upstream failed → omit block
 
-      this.renderBoard(snapshot!, transitions, brief);
+      this.renderBoard(snapshot!, transitions, brief, fallbackFrom);
     });
   }
 
   private renderLoading(): void {
     this.body.innerHTML =
-      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Loading regional snapshot…</div>';
+      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Loading regional intelligence…</div>';
   }
 
   private renderEmpty(): void {
     this.body.innerHTML =
-      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">No snapshot available yet for this region. The next cron cycle will populate it within 6 hours.</div>';
+      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Regional intelligence is being refreshed. Try selecting another region above.</div>';
   }
 
   private renderError(message: string): void {
-    this.body.innerHTML = `<div class="rib-status rib-status-error" style="padding:16px;color:var(--danger);font-size:12px">Failed to load snapshot: ${escapeHtml(message)}</div>`;
+    this.body.innerHTML = `<div class="rib-status rib-status-error" style="padding:16px;color:var(--danger);font-size:12px">We couldn't load this region right now: ${escapeHtml(message)}</div>`;
   }
 
   /** Render the full board HTML from a hydrated snapshot + optional Phase 3 data.
-   *  null = RPC failed (omit block entirely), array/object = RPC succeeded (render, even if empty). */
-  public renderBoard(snapshot: RegionalSnapshot, transitions?: RegimeTransition[] | null, brief?: RegionalBrief | null): void {
-    let html = buildBoardHtml(snapshot);
+   *  null = RPC failed (omit block entirely), array/object = RPC succeeded (render, even if empty).
+   *  fallbackFrom: when set, renders a small notice explaining we're showing a
+   *  different region than the one the user selected. */
+  public renderBoard(
+    snapshot: RegionalSnapshot,
+    transitions?: RegimeTransition[] | null,
+    brief?: RegionalBrief | null,
+    fallbackFrom?: string | null,
+  ): void {
+    let html = '';
+    if (fallbackFrom) {
+      const requestedLabel = BOARD_REGIONS.find(r => r.id === fallbackFrom)?.label ?? fallbackFrom;
+      const actualLabel = BOARD_REGIONS.find(r => r.id === snapshot.regionId)?.label ?? snapshot.regionId;
+      html += `<div class="rib-fallback-notice" style="padding:10px 16px;margin:0 0 8px;background:var(--bg-elevated,rgba(255,255,255,0.04));border-left:3px solid var(--warning,#d4a015);font-size:12px;color:var(--text-dim);line-height:1.5">${escapeHtml(requestedLabel)} is being refreshed — showing ${escapeHtml(actualLabel)} in the meantime.</div>`;
+    }
+    html += buildBoardHtml(snapshot);
     // Phase 3 blocks: only render when the RPC succeeded (non-null).
     // null means the RPC failed — omit the block so we don't show a
     // misleading "no data yet" message for a transient outage.
