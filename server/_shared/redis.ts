@@ -284,11 +284,16 @@ export function __resetFetcherTimeoutForTests(): void {
  * cleared as soon as the fetcher wins so we don't leak handles or keep the
  * isolate awake unnecessarily.
  */
-function withFetcherTimeout<T>(promise: Promise<T>, key: string, timeoutMs: number): Promise<T> {
+function withFetcherTimeout<T>(
+  promise: Promise<T>,
+  key: string,
+  timeoutMs: number,
+  callerName: 'cachedFetchJson' | 'cachedFetchJsonWithMeta',
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`cachedFetchJson timeout after ${timeoutMs}ms for "${key}"`));
+      reject(new Error(`${callerName} timeout after ${timeoutMs}ms for "${key}"`));
     }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
@@ -333,7 +338,7 @@ export async function cachedFetchJson<T extends object>(
   if (existing) return existing as Promise<T | null>;
 
   const timeoutMs = opts?.timeoutMs ?? fetcherTimeoutDefaultMs;
-  const promise = withFetcherTimeout(fetcher(), key, timeoutMs)
+  const promise = withFetcherTimeout(fetcher(), key, timeoutMs, 'cachedFetchJson')
     .then(async (result) => {
       if (result != null) {
         await setCachedJson(key, result, ttlSeconds);
@@ -414,7 +419,7 @@ export async function cachedFetchJsonWithMeta<T extends object>(
   let cacheStatus: 'miss' | 'neg-sentinel' = 'miss';
 
   const timeoutMs = opts?.timeoutMs ?? fetcherTimeoutDefaultMs;
-  const promise = withFetcherTimeout(fetcher(), key, timeoutMs)
+  const promise = withFetcherTimeout(fetcher(), key, timeoutMs, 'cachedFetchJsonWithMeta')
     .then(async (result) => {
       // Only count an upstream call as a 200 when it actually returned data.
       // A null result triggers the neg-sentinel branch below — these are
