@@ -23,6 +23,15 @@ export class TechReadinessPanel extends Panel {
   private loading = false;
   private lastFetch = 0;
   private readonly REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
+  /**
+   * Backoff timer for retrying after an empty/failed fetch. Without this,
+   * a single transient blip (slow-tier bootstrap abort + lazy-fetch fail)
+   * left the panel stuck in an empty/error state until the user restarted
+   * the app — refresh() is only fired at startup.
+   */
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private emptyRetryAttempt = 0;
+  private readonly MAX_RETRY_ATTEMPTS = 5;
 
   constructor() {
     super({
@@ -40,21 +49,77 @@ export class TechReadinessPanel extends Panel {
     }
 
     this.loading = true;
+    this.clearRetryTimer();
     this.showFetchingState();
 
     try {
-      this.rankings = await getTechReadinessRankings();
+      const result = await getTechReadinessRankings();
       if (!this.element?.isConnected) return;
+      this.rankings = result;
+      this.setCount(result.length);
+      if (result.length === 0) {
+        // Server returned an empty payload (NOT a network failure — those
+        // throw and land in the catch branch). Show a soft "refreshing"
+        // state and retry on backoff in case the seed-meta is briefly out
+        // of step with the underlying data key, instead of painting the
+        // panel red as a hard error. Don't stamp lastFetch — we want
+        // explicit retries, not a 6h cooldown on no data.
+        this.showSoftRefreshing();
+        this.scheduleRetry();
+        return;
+      }
       this.lastFetch = Date.now();
-      this.setCount(this.rankings.length);
+      this.emptyRetryAttempt = 0;
       this.render();
     } catch (error) {
       if (!this.element?.isConnected) return;
       console.error('[TechReadinessPanel] Error fetching data:', error);
-      this.showError(t('common.failedTechReadiness'));
+      // Pass an onRetry callback so Panel.showError renders an auto-retry
+      // countdown with exponential backoff (15s, 30s, 60s, ...). Previously
+      // the error state had no retry path at all — once it failed, the user
+      // had to restart the app to recover.
+      this.showError(t('common.failedTechReadiness'), () => void this.refresh());
     } finally {
       this.loading = false;
     }
+  }
+
+  override destroy(): void {
+    this.clearRetryTimer();
+    super.destroy();
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  private scheduleRetry(): void {
+    if (this.emptyRetryAttempt >= this.MAX_RETRY_ATTEMPTS) return;
+    // 30s → 60s → 2m → 4m → 5m (capped). Bounded so we don't hammer an
+    // upstream that's genuinely down, but quick enough that a user who
+    // tripped over a transient blip recovers without restarting the app.
+    const delays = [30_000, 60_000, 120_000, 240_000, 300_000];
+    const delay = delays[this.emptyRetryAttempt] ?? 300_000;
+    this.emptyRetryAttempt += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.refresh();
+    }, delay);
+  }
+
+  private showSoftRefreshing(): void {
+    // Soft empty state — distinct from showError() so the panel header
+    // doesn't paint red on a benign empty payload. Caller schedules an
+    // auto-retry; this is just the visual placeholder while we wait.
+    this.setContent(`
+      <div class="panel-soft-empty" style="padding:24px 16px;color:var(--text-dim);font-size:12px;text-align:center;line-height:1.5">
+        <div style="font-size:20px;margin-bottom:8px">⌛</div>
+        <div>${escapeHtml(t('components.techReadiness.dataPreparing'))}</div>
+      </div>
+    `);
   }
 
   private showFetchingState(): void {
@@ -108,12 +173,11 @@ export class TechReadinessPanel extends Panel {
   }
 
   private render(): void {
-    if (this.rankings.length === 0) {
-      this.showError(t('common.noDataAvailable'));
-      return;
-    }
-
-    // Show top 25 countries
+    // Empty-result branch was removed: refresh() now routes empty payloads
+    // through showSoftRefreshing() + scheduleRetry() and only calls render()
+    // when there's data to show. Painting "no data available" via
+    // showError() flipped the panel into red error styling and gave the
+    // user no recovery path on a benign empty payload.
     const top = this.rankings.slice(0, 25);
 
     const html = `
