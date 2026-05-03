@@ -283,6 +283,15 @@ export function __resetFetcherTimeoutForTests(): void {
  * guaranteed to settle even if the fetcher hangs forever. The timer is
  * cleared as soon as the fetcher wins so we don't leak handles or keep the
  * isolate awake unnecessarily.
+ *
+ * Known limitation: this only times out the cache-layer wrapper — the
+ * underlying fetcher promise is NOT cancelled. A truly hung upstream
+ * fetcher continues running in the background until the isolate recycles
+ * (~socket + small heap residue per orphan). Inflight-slot release means
+ * subsequent callers re-fetch successfully, so user-facing behavior is
+ * correct; only resource-cost is affected. True cancellation would require
+ * threading an AbortSignal through the fetcher contract, which is a wider
+ * refactor across every cached-fetch call site.
  */
 function withFetcherTimeout<T>(
   promise: Promise<T>,
