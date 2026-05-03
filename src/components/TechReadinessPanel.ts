@@ -50,13 +50,15 @@ export class TechReadinessPanel extends Panel {
       showCount: true,
       infoTooltip: t('components.techReadiness.infoTooltip'),
     });
+    this.hideCountBadge();
   }
 
-  public async refresh(): Promise<void> {
+  public async refresh(isRetry = false): Promise<void> {
     if (this.loading) return;
     if (Date.now() - this.lastFetch < this.REFRESH_INTERVAL && this.rankings.length > 0) {
       return;
     }
+    if (!isRetry) this.localRetryAttempt = 0;
 
     this.loading = true;
     this.clearRetryTimer();
@@ -66,7 +68,6 @@ export class TechReadinessPanel extends Panel {
       const result = await getTechReadinessRankings();
       if (!this.element?.isConnected) return;
       this.rankings = result;
-      this.setCount(result.length);
       if (result.length === 0) {
         // Server returned an empty payload (NOT a network failure — those
         // throw and land in the catch branch). Show a soft "refreshing"
@@ -96,7 +97,7 @@ export class TechReadinessPanel extends Panel {
       }
       this.showError(
         t('common.failedTechReadiness'),
-        () => void this.refresh(),
+        () => void this.refresh(true),
         Math.round(delayMs / 1000),
       );
     } finally {
@@ -116,6 +117,15 @@ export class TechReadinessPanel extends Panel {
     }
   }
 
+  private hideCountBadge(): void {
+    if (this.countEl) this.countEl.style.display = 'none';
+  }
+
+  private showCountBadge(count: number): void {
+    this.setCount(count);
+    if (this.countEl) this.countEl.style.display = '';
+  }
+
   /**
    * Returns the next backoff delay in ms, or null when MAX_RETRY_ATTEMPTS
    * is reached. Increments the counter as a side effect.
@@ -132,7 +142,7 @@ export class TechReadinessPanel extends Panel {
     if (delay === null) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      void this.refresh();
+      void this.refresh(true);
     }, delay);
   }
 
@@ -147,6 +157,7 @@ export class TechReadinessPanel extends Panel {
    * to keep the red header for the terminal error.
    */
   private renderTerminalError(): void {
+    this.hideCountBadge();
     this.setContent(`
       <div class="panel-error-state" style="padding:24px 16px;text-align:center">
         <div class="panel-error-msg" style="color:var(--danger,#e0654b);font-size:13px">
@@ -161,6 +172,7 @@ export class TechReadinessPanel extends Panel {
     // Soft empty state — distinct from showError() so the panel header
     // doesn't paint red on a benign empty payload. Caller schedules an
     // auto-retry; this is just the visual placeholder while we wait.
+    this.hideCountBadge();
     this.setContent(`
       <div class="panel-soft-empty" style="padding:24px 16px;color:var(--text-dim);font-size:12px;text-align:center;line-height:1.5">
         <div style="font-size:20px;margin-bottom:8px">⌛</div>
@@ -226,6 +238,7 @@ export class TechReadinessPanel extends Panel {
     // showError() flipped the panel into red error styling and gave the
     // user no recovery path on a benign empty payload.
     const top = this.rankings.slice(0, 25);
+    this.showCountBadge(this.rankings.length);
 
     const html = `
       <div class="tech-readiness-list">
