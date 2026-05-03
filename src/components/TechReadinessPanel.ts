@@ -24,14 +24,24 @@ export class TechReadinessPanel extends Panel {
   private lastFetch = 0;
   private readonly REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
   /**
-   * Backoff timer for retrying after an empty/failed fetch. Without this,
-   * a single transient blip (slow-tier bootstrap abort + lazy-fetch fail)
-   * left the panel stuck in an empty/error state until the user restarted
-   * the app — refresh() is only fired at startup.
+   * Local backoff state for retrying after an empty/failed fetch. Without
+   * this, a single transient blip (slow-tier bootstrap abort + lazy-fetch
+   * fail) left the panel stuck in an empty/error state until the user
+   * restarted the app — refresh() is only fired at startup.
+   *
+   * Crucially, this counter MUST be local. Panel's own retryAttempt is
+   * reset to 0 by every call to setContent() (e.g. via showFetchingState
+   * at the top of refresh()), so relying on Panel.showError's default
+   * `Math.min(15 * 2 ** retryAttempt, 180)` gave a flat 15s loop that
+   * hammered the upstream every cycle during a persistent outage.
    */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
-  private emptyRetryAttempt = 0;
+  private localRetryAttempt = 0;
   private readonly MAX_RETRY_ATTEMPTS = 5;
+  /** 30s → 60s → 2m → 4m → 5m (capped). Same delays for empty-payload
+   *  and error retries — both indicate "try again later," and we want
+   *  the same upstream-friendly cadence in either case. */
+  private readonly RETRY_DELAYS_MS: ReadonlyArray<number> = [30_000, 60_000, 120_000, 240_000, 300_000];
 
   constructor() {
     super({
@@ -69,16 +79,26 @@ export class TechReadinessPanel extends Panel {
         return;
       }
       this.lastFetch = Date.now();
-      this.emptyRetryAttempt = 0;
+      this.localRetryAttempt = 0;
       this.render();
     } catch (error) {
       if (!this.element?.isConnected) return;
       console.error('[TechReadinessPanel] Error fetching data:', error);
-      // Pass an onRetry callback so Panel.showError renders an auto-retry
-      // countdown with exponential backoff (15s, 30s, 60s, ...). Previously
-      // the error state had no retry path at all — once it failed, the user
-      // had to restart the app to recover.
-      this.showError(t('common.failedTechReadiness'), () => void this.refresh());
+      // Compute the backoff delay LOCALLY rather than letting Panel.showError
+      // fall back to its retryAttempt-based formula — that counter is
+      // reset by every showFetchingState() call at the top of refresh(),
+      // so the default flow gave a flat 15s retry loop that hammered the
+      // upstream every cycle.
+      const delayMs = this.nextRetryDelayMs();
+      if (delayMs === null) {
+        this.renderTerminalError();
+        return;
+      }
+      this.showError(
+        t('common.failedTechReadiness'),
+        () => void this.refresh(),
+        Math.round(delayMs / 1000),
+      );
     } finally {
       this.loading = false;
     }
@@ -96,18 +116,45 @@ export class TechReadinessPanel extends Panel {
     }
   }
 
+  /**
+   * Returns the next backoff delay in ms, or null when MAX_RETRY_ATTEMPTS
+   * is reached. Increments the counter as a side effect.
+   */
+  private nextRetryDelayMs(): number | null {
+    if (this.localRetryAttempt >= this.MAX_RETRY_ATTEMPTS) return null;
+    const delay = this.RETRY_DELAYS_MS[this.localRetryAttempt] ?? 300_000;
+    this.localRetryAttempt += 1;
+    return delay;
+  }
+
   private scheduleRetry(): void {
-    if (this.emptyRetryAttempt >= this.MAX_RETRY_ATTEMPTS) return;
-    // 30s → 60s → 2m → 4m → 5m (capped). Bounded so we don't hammer an
-    // upstream that's genuinely down, but quick enough that a user who
-    // tripped over a transient blip recovers without restarting the app.
-    const delays = [30_000, 60_000, 120_000, 240_000, 300_000];
-    const delay = delays[this.emptyRetryAttempt] ?? 300_000;
-    this.emptyRetryAttempt += 1;
+    const delay = this.nextRetryDelayMs();
+    if (delay === null) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       void this.refresh();
     }, delay);
+  }
+
+  /**
+   * Render a terminal "out of retries" error state. Bypasses Panel.showError
+   * because calling that without an onRetry would re-fire the prior
+   * retryCallback (Panel only replaces retryCallback when onRetry is
+   * defined — passing undefined leaves the stale one in place and starts
+   * a new countdown).
+   *
+   * setContent() sync-resets setErrorState(false), so we re-flip it AFTER
+   * to keep the red header for the terminal error.
+   */
+  private renderTerminalError(): void {
+    this.setContent(`
+      <div class="panel-error-state" style="padding:24px 16px;text-align:center">
+        <div class="panel-error-msg" style="color:var(--danger,#e0654b);font-size:13px">
+          ${escapeHtml(t('common.failedTechReadiness'))}
+        </div>
+      </div>
+    `);
+    this.setErrorState(true);
   }
 
   private showSoftRefreshing(): void {
