@@ -918,7 +918,7 @@ export class App {
             if (ok && isHeadlineMemoryEnabled()) {
               mlWorker.loadModel('embeddings').catch(() => { });
             }
-          });
+          }).catch(() => { });
         } else if (!isDesktopRuntime()) {
           // Browser Local Model is the parent toggle for ALL local-model use,
           // including Headline Memory. Terminate unconditionally on web —

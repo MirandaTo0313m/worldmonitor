@@ -74,8 +74,9 @@ export function getAiFlowSettings(): AiFlowSettings {
  * a local embeddings model in the ML worker, so on web it can only function
  * when the Browser Local Model parent toggle is also enabled — otherwise
  * we'd silently download/run an ML model the user opted out of via the
- * parent toggle. The persisted value is preserved so re-enabling Browser
- * Local Model restores the user's prior Headline Memory choice.
+ * parent toggle. The persisted value is preserved (the settings UI reads
+ * `getAiFlowSettings().headlineMemory` for the raw value) so re-enabling
+ * Browser Local Model restores the user's prior Headline Memory choice.
  *
  * The Browser Local Model toggle is web-only — `preferences-content.ts`
  * skips rendering it on desktop, and `App.ts` initializes the ML worker
@@ -89,16 +90,6 @@ export function isHeadlineMemoryEnabled(): boolean {
   if (isDesktopRuntime()) return true;
   const browser = readBool(STORAGE_KEY_BROWSER_MODEL, DEFAULTS.browserModel);
   return browser;
-}
-
-/**
- * Raw persisted Headline Memory toggle state — used by settings UI render
- * so the toggle reflects the user's stored preference even when the parent
- * Browser Local Model toggle is off. Runtime gates should use
- * `isHeadlineMemoryEnabled()` instead.
- */
-export function getHeadlineMemoryRawValue(): boolean {
-  return readBool(STORAGE_KEY_HEADLINE_MEMORY, DEFAULTS.headlineMemory);
 }
 
 export function setAiFlowSetting(key: keyof AiFlowSettings, value: boolean): void {
