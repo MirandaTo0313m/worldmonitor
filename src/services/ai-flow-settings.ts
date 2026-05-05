@@ -6,6 +6,8 @@
  *       settings hub once the UI is extended with additional sections.
  */
 
+import { isDesktopRuntime } from './runtime';
+
 const STORAGE_KEY_BROWSER_MODEL = 'wm-ai-flow-browser-model';
 const STORAGE_KEY_CLOUD_LLM = 'wm-ai-flow-cloud-llm';
 const STORAGE_KEY_MAP_NEWS_FLASH = 'wm-map-news-flash';
@@ -69,17 +71,24 @@ export function getAiFlowSettings(): AiFlowSettings {
 
 /**
  * Effective Headline Memory state. Headline Memory implementation requires
- * a local embeddings model in the ML worker, so it can only function when
- * Browser Local Model is also enabled. When Browser Local Model is OFF,
- * Headline Memory is treated as OFF regardless of its persisted toggle —
- * otherwise we'd silently download/run an ML model the user opted out of
- * via the parent toggle. The persisted value is preserved so re-enabling
- * Browser Local Model restores the user's prior Headline Memory choice.
+ * a local embeddings model in the ML worker, so on web it can only function
+ * when the Browser Local Model parent toggle is also enabled — otherwise
+ * we'd silently download/run an ML model the user opted out of via the
+ * parent toggle. The persisted value is preserved so re-enabling Browser
+ * Local Model restores the user's prior Headline Memory choice.
+ *
+ * The Browser Local Model toggle is web-only — `preferences-content.ts`
+ * skips rendering it on desktop, and `App.ts` initializes the ML worker
+ * unconditionally on desktop. So the parent gate must be skipped on
+ * desktop, otherwise Headline Memory would be silently dead on every
+ * desktop install (the hidden web key never flips to true).
  */
 export function isHeadlineMemoryEnabled(): boolean {
   const headline = readBool(STORAGE_KEY_HEADLINE_MEMORY, DEFAULTS.headlineMemory);
+  if (!headline) return false;
+  if (isDesktopRuntime()) return true;
   const browser = readBool(STORAGE_KEY_BROWSER_MODEL, DEFAULTS.browserModel);
-  return headline && browser;
+  return browser;
 }
 
 /**
