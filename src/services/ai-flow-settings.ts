@@ -67,7 +67,28 @@ export function getAiFlowSettings(): AiFlowSettings {
   };
 }
 
+/**
+ * Effective Headline Memory state. Headline Memory implementation requires
+ * a local embeddings model in the ML worker, so it can only function when
+ * Browser Local Model is also enabled. When Browser Local Model is OFF,
+ * Headline Memory is treated as OFF regardless of its persisted toggle —
+ * otherwise we'd silently download/run an ML model the user opted out of
+ * via the parent toggle. The persisted value is preserved so re-enabling
+ * Browser Local Model restores the user's prior Headline Memory choice.
+ */
 export function isHeadlineMemoryEnabled(): boolean {
+  const headline = readBool(STORAGE_KEY_HEADLINE_MEMORY, DEFAULTS.headlineMemory);
+  const browser = readBool(STORAGE_KEY_BROWSER_MODEL, DEFAULTS.browserModel);
+  return headline && browser;
+}
+
+/**
+ * Raw persisted Headline Memory toggle state — used by settings UI render
+ * so the toggle reflects the user's stored preference even when the parent
+ * Browser Local Model toggle is off. Runtime gates should use
+ * `isHeadlineMemoryEnabled()` instead.
+ */
+export function getHeadlineMemoryRawValue(): boolean {
   return readBool(STORAGE_KEY_HEADLINE_MEMORY, DEFAULTS.headlineMemory);
 }
 
