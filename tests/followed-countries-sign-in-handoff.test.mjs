@@ -104,6 +104,9 @@ const {
   _emitAuthStateForTests,
   _getInternalStateForTests,
   _pushSubscriptionSnapshotForTests,
+  _setHandoffBackoffForTests,
+  _clearFailedHandoffForTests,
+  _installCrossTabStorageListenerForTests,
 } = svc;
 
 // ---------------------------------------------------------------------------
@@ -269,6 +272,9 @@ function setupSignedIn(userId, { tier = 1, fakeClient }) {
 
 beforeEach(() => {
   _resetStateForTests();
+  // Collapse retry backoff to 0 so visibility-driven retries fire on the
+  // next microtask. Production uses 1s/2s/4s/8s/16s. (P1 #4 test seam.)
+  _setHandoffBackoffForTests([0, 0, 0, 0, 0]);
   setupAnonymous();
 });
 
@@ -791,5 +797,290 @@ describe('U3 — unfollowCountry post-handoff', () => {
 
     const r = await removeCountry('FR');
     assert.deepEqual(r, { ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 fixes — coverage for P1 #3, #4, #5, #6, #10, #11 and P2 #20.
+// ---------------------------------------------------------------------------
+
+describe('Phase2 — P1 #3 permanent ConvexError kinds skip retry, transition to failed-permanent', () => {
+  it("INPUT_TOO_LARGE → 'failed-permanent'; localStorage cleared; no visibility-retry listener", async () => {
+    setLocalStorageList(['US']);
+    const e = new Error('ConvexError: INPUT_TOO_LARGE');
+    e.data = { kind: 'INPUT_TOO_LARGE' };
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: e });
+    setupSignedIn('user_itl', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_itl' });
+    await flushMicrotasks();
+
+    const state = _getInternalStateForTests();
+    assert.equal(state.handoffState, 'failed-permanent');
+    assert.equal(getLocalStorageRaw(), null, 'localStorage cleared on permanent kind');
+    assert.equal(state.hasVisibilityRetryListener, false, 'no visibility retry scheduled');
+  });
+
+  it("EMPTY_INPUT → 'failed-permanent'; no retry", async () => {
+    setLocalStorageList(['US']);
+    const e = new Error('ConvexError: EMPTY_INPUT');
+    e.data = { kind: 'EMPTY_INPUT' };
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: e });
+    setupSignedIn('user_ei', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_ei' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed-permanent');
+    assert.equal(_getInternalStateForTests().hasVisibilityRetryListener, false);
+  });
+
+  it("UNAUTHENTICATED → 'failed-permanent'; localStorage cleared", async () => {
+    setLocalStorageList(['US']);
+    const e = new Error('ConvexError: UNAUTHENTICATED');
+    e.data = { kind: 'UNAUTHENTICATED' };
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: e });
+    setupSignedIn('user_un', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_un' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed-permanent');
+    assert.equal(getLocalStorageRaw(), null);
+  });
+
+  it('plain network error (no ConvexError data) → still transient: failed + retry scheduled', async () => {
+    setLocalStorageList(['US']);
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: new Error('NetworkError') });
+    setupSignedIn('user_net', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_net' });
+    await flushMicrotasks();
+
+    const state = _getInternalStateForTests();
+    assert.equal(state.handoffState, 'failed');
+    assert.equal(state.hasVisibilityRetryListener, true);
+    assert.notEqual(getLocalStorageRaw(), null, 'localStorage retained on transient');
+  });
+});
+
+describe('Phase2 — P1 #4 max-retry exhaustion → failed-permanent; recovery via _clearFailedHandoffForTests', () => {
+  it('after MAX_HANDOFF_RETRIES (5) visibility events, state flips to failed-permanent', async () => {
+    setLocalStorageList(['US']);
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: new Error('NetworkError') });
+    setupSignedIn('user_max', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_max' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed');
+
+    // Fire visibilitychange MAX_HANDOFF_RETRIES (5) times. Each attempt
+    // re-fails (mergeRejection persists). On the 6th failure we expect
+    // failed-permanent since attempt counter has reached the budget.
+    for (let i = 0; i < 5; i++) {
+      _document.dispatchEvent(new Event('visibilitychange'));
+      // backoff override is 0, so the retry runs on next microtask.
+      await flushMicrotasks();
+      await flushMicrotasks();
+    }
+    assert.equal(_getInternalStateForTests().handoffState, 'failed-permanent');
+    assert.equal(_getInternalStateForTests().hasVisibilityRetryListener, false);
+  });
+
+  it('_clearFailedHandoffForTests resets failed-permanent → idle', async () => {
+    setLocalStorageList(['US']);
+    const e = new Error('ConvexError: INPUT_TOO_LARGE');
+    e.data = { kind: 'INPUT_TOO_LARGE' };
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: e });
+    setupSignedIn('user_clr', { tier: 1, fakeClient: fake });
+    await _emitAuthStateForTests({ id: 'user_clr' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed-permanent');
+
+    _clearFailedHandoffForTests();
+    assert.equal(_getInternalStateForTests().handoffState, 'idle');
+  });
+});
+
+describe('Phase2 — P1 #5 signed-in addCountry/removeCountry returns HANDOFF_PENDING when client is null', () => {
+  it('addCountry: client null → HANDOFF_PENDING; localStorage NOT written', async () => {
+    // User is signed in but the convex client returns null (Convex is
+    // misconfigured for this env, e.g., missing VITE_CONVEX_URL). Use
+    // 'force-null' to make the test getter return null directly without
+    // falling through to the production import that would crash on
+    // import.meta.env.
+    _setDepsForTests({
+      getCurrentClerkUser: () => ({ id: 'user_nullc' }),
+      getEntitlementState: () => ({ features: { tier: 1 } }),
+      hasTier: (n) => n <= 1,
+      featureFlagEnabled: true,
+      convexClient: 'force-null',
+      convexApi: 'force-null',
+    });
+    await _emitAuthStateForTests({ id: 'user_nullc' });
+    await flushMicrotasks();
+
+    const result = await addCountry('US');
+    assert.deepEqual(result, { ok: false, reason: 'HANDOFF_PENDING' });
+    assert.equal(getLocalStorageRaw(), null, 'localStorage NOT written in signed-in mode');
+  });
+
+  it('removeCountry: client null → HANDOFF_PENDING; localStorage NOT written', async () => {
+    _setDepsForTests({
+      getCurrentClerkUser: () => ({ id: 'user_nullc2' }),
+      getEntitlementState: () => ({ features: { tier: 1 } }),
+      hasTier: (n) => n <= 1,
+      featureFlagEnabled: true,
+      convexClient: 'force-null',
+      convexApi: 'force-null',
+    });
+    await _emitAuthStateForTests({ id: 'user_nullc2' });
+    await flushMicrotasks();
+
+    const result = await removeCountry('US');
+    assert.deepEqual(result, { ok: false, reason: 'HANDOFF_PENDING' });
+    assert.equal(getLocalStorageRaw(), null);
+  });
+});
+
+describe('Phase2 — P1 #6 stale-snapshot does NOT short-circuit signed-in mutation', () => {
+  it('snapshot says US already followed BUT actual table doesnt → addCountry still calls Convex', async () => {
+    // Set up a stale snapshot via _pushSubscriptionSnapshotForTests
+    // BEFORE Convex confirms it. The previous behaviour would have
+    // short-circuited; now we expect the Convex mutation to be called.
+    const fake = makeFakeConvex({ tier: 1, initialRows: [] });
+    setupSignedIn('user_stale', { tier: 1, fakeClient: fake });
+    await _emitAuthStateForTests({ id: 'user_stale' });
+    await flushMicrotasks();
+
+    // Force-push a stale snapshot claiming 'US' is followed.
+    _pushSubscriptionSnapshotForTests('user_stale', ['US']);
+
+    const callsBefore = fake._calls.follow.length;
+    const result = await addCountry('US');
+    const callsAfter = fake._calls.follow.length;
+
+    // P1 #6 — must have called Convex (no client-side short-circuit).
+    assert.equal(result.ok, true);
+    assert.equal(callsAfter, callsBefore + 1, 'Convex follow mutation called despite stale snapshot');
+  });
+});
+
+describe('Phase2 — P1 #10 cross-tab storage event re-dispatches as WM_FOLLOWED_COUNTRIES_CHANGED', () => {
+  it('window storage event for our key fires the watchlist change event', () => {
+    _installCrossTabStorageListenerForTests();
+    let fired = 0;
+    const handler = () => { fired += 1; };
+    _window.addEventListener(WM_FOLLOWED_COUNTRIES_CHANGED, handler);
+
+    // StorageEvent shape varies; node 22 supports `new Event(...)` with key prop on synthetic.
+    const ev = new Event('storage');
+    Object.defineProperty(ev, 'key', { value: FOLLOWED_COUNTRIES_STORAGE_KEY });
+    _window.dispatchEvent(ev);
+
+    assert.equal(fired, 1, 'cross-tab storage event re-dispatched');
+    _window.removeEventListener(WM_FOLLOWED_COUNTRIES_CHANGED, handler);
+  });
+
+  it('window storage event for an unrelated key does NOT fire', () => {
+    _installCrossTabStorageListenerForTests();
+    let fired = 0;
+    const handler = () => { fired += 1; };
+    _window.addEventListener(WM_FOLLOWED_COUNTRIES_CHANGED, handler);
+
+    const ev = new Event('storage');
+    Object.defineProperty(ev, 'key', { value: 'unrelated-key' });
+    _window.dispatchEvent(ev);
+
+    assert.equal(fired, 0);
+    _window.removeEventListener(WM_FOLLOWED_COUNTRIES_CHANGED, handler);
+  });
+});
+
+describe('Phase2 — P1 #11 post-await auth re-check returns HANDOFF_PENDING', () => {
+  it('addCountry: user signs out mid-await → HANDOFF_PENDING; mutation not committed in convex view', async () => {
+    // We use a delayed mutation. Mid-await, we flip Clerk to null
+    // (sign-out). The post-await re-check should detect the gen change
+    // and return HANDOFF_PENDING.
+    let _user = { id: 'user_au' };
+    let mutationStarted = null;
+    const fake = {
+      async mutation(ref, args) {
+        if (ref === FAKE_API.followedCountries.followCountry) {
+          mutationStarted = args;
+          await new Promise((r) => setTimeout(r, 30));
+          return { ok: true, idempotent: false };
+        }
+        throw new Error(`unmocked: ${ref}`);
+      },
+      onUpdate(ref, _a, cb) {
+        if (ref === FAKE_API.followedCountries.listFollowed) {
+          Promise.resolve().then(() => cb([]));
+          return () => {};
+        }
+        throw new Error(`unmocked: ${ref}`);
+      },
+    };
+    _setDepsForTests({
+      getCurrentClerkUser: () => _user,
+      getEntitlementState: () => ({ features: { tier: 1 } }),
+      hasTier: (n) => n <= 1,
+      featureFlagEnabled: true,
+      convexClient: fake,
+      convexApi: FAKE_API,
+    });
+    await _emitAuthStateForTests({ id: 'user_au' });
+    await flushMicrotasks();
+
+    // Kick off addCountry; while the mutation is in flight, sign out.
+    const addPromise = addCountry('US');
+    // Wait a tick so the mutation actually starts.
+    await new Promise((r) => setTimeout(r, 5));
+    _user = null;
+    setupAnonymous();
+    await _emitAuthStateForTests(null);
+
+    const result = await addPromise;
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'HANDOFF_PENDING');
+    // The mutation MAY have started before sign-out (we don't undo the
+    // call), but the result is dropped — addCountry returned PENDING.
+    void mutationStarted;
+  });
+});
+
+describe('Phase2 — P2 #20 empty-handoff path does not dispatch change before snapshot', () => {
+  it('empty localStorage → handoff complete fires change ONLY after first snapshot lands', async () => {
+    setLocalStorageList([]);
+    let listCb = null;
+    const fake = {
+      async mutation() { throw new Error('not used'); },
+      onUpdate(ref, _a, cb) {
+        if (ref === FAKE_API.followedCountries.listFollowed) {
+          listCb = cb;
+          // DELIBERATELY do NOT push the snapshot synchronously.
+          return () => { if (listCb === cb) listCb = null; };
+        }
+        throw new Error(`unmocked: ${ref}`);
+      },
+    };
+    setupSignedIn('user_p20', { tier: 1, fakeClient: fake });
+
+    let events = 0;
+    const unsub = subscribe(() => { events += 1; });
+
+    await _emitAuthStateForTests({ id: 'user_p20' });
+    await flushMicrotasks();
+
+    // Handoff is 'complete' but no snapshot has arrived yet.
+    assert.equal(_getInternalStateForTests().handoffState, 'complete');
+    assert.equal(_getInternalStateForTests().initialSnapshotReceived, false);
+    // Empty-handoff path defers dispatchChanged → no events yet.
+    assert.equal(events, 0, 'no change event before first snapshot');
+
+    // Now push the first snapshot.
+    if (listCb) listCb([]);
+    assert.equal(_getInternalStateForTests().initialSnapshotReceived, true);
+    assert.equal(events, 1, 'change event fires after first snapshot');
+
+    unsub();
   });
 });

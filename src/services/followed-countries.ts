@@ -35,6 +35,7 @@
  * extraction reads `err.data.kind`, not substring-match the message.
  */
 
+import type { FunctionReference } from 'convex/server';
 import { toIso2 } from '../utils/country-codes';
 import {
   getEntitlementState as _getEntitlementState,
@@ -46,6 +47,7 @@ import {
   getConvexClient as _getConvexClient,
   getConvexApi as _getConvexApi,
 } from './convex-client';
+import type { MergeAnonymousLocalResult as ServerMergeAnonymousLocalResult } from '../../convex/followedCountries';
 
 // ---------------------------------------------------------------------------
 // Public constants & types
@@ -83,16 +85,48 @@ export type FollowMutationResult =
 export type ServiceEntitlementState = 'pro' | 'free' | 'loading';
 
 /**
+ * Strongly-typed Convex function references for the followedCountries
+ * surface. Using `FunctionReference<...>` (vs the previous `unknown`
+ * placeholders) eliminates the `{country: code}` vs `{countries: code}`
+ * typo class — the compiler now requires the exact arg shape per ref.
+ *
+ * P1 #8 — replaces the previous `ConvexClientLike` / `ConvexApiLike`
+ * unknown-based shapes.
+ */
+type FollowCountryRef = FunctionReference<
+  'mutation',
+  'public',
+  { country: string },
+  { ok: true; idempotent: boolean }
+>;
+type UnfollowCountryRef = FunctionReference<
+  'mutation',
+  'public',
+  { country: string },
+  { ok: true; idempotent: boolean }
+>;
+type MergeAnonymousLocalRef = FunctionReference<
+  'mutation',
+  'public',
+  { countries: string[] },
+  ServerMergeAnonymousLocalResult
+>;
+type ListFollowedRef = FunctionReference<'query', 'public', Record<string, never>, string[]>;
+
+/**
  * Subset of `convex/browser`.ConvexClient surface that this module uses.
  * Defined as an interface so tests can inject a fake without pulling the
  * real WebSocket transport.
  */
 export interface ConvexClientLike {
-  mutation: (ref: unknown, args: unknown) => Promise<unknown>;
-  onUpdate: (
-    ref: unknown,
-    args: unknown,
-    onResult: (result: unknown) => void,
+  mutation: <Ref extends FunctionReference<'mutation'>>(
+    ref: Ref,
+    args: Ref['_args'],
+  ) => Promise<Ref['_returnType']>;
+  onUpdate: <Ref extends FunctionReference<'query'>>(
+    ref: Ref,
+    args: Ref['_args'],
+    onResult: (result: Ref['_returnType']) => void,
     onError?: (err: Error) => void,
   ) => () => void; // returns an unsubscribe fn (or { unsubscribe })
 }
@@ -109,12 +143,17 @@ type ClerkUserGetter = () => { id: string } | null;
 type EntitlementStateGetter = () => { features?: { tier?: number } } | null;
 type HasTierFn = (minTier: number) => boolean;
 
+/**
+ * Strongly-typed Convex API surface this module needs. Mirrors the
+ * generated `api.followedCountries` shape via `FunctionReference<...>`
+ * generics so arg/result shapes are checked at the call site.
+ */
 interface ConvexApiLike {
   followedCountries: {
-    followCountry: unknown;
-    unfollowCountry: unknown;
-    mergeAnonymousLocal: unknown;
-    listFollowed: unknown;
+    followCountry: FollowCountryRef;
+    unfollowCountry: UnfollowCountryRef;
+    mergeAnonymousLocal: MergeAnonymousLocalRef;
+    listFollowed: ListFollowedRef;
   };
 }
 
@@ -129,14 +168,20 @@ let _convexClientGetter: () => Promise<ConvexClientLike | null> = async () =>
 let _convexApiGetter: () => Promise<ConvexApiLike | null> = async () =>
   (await _getConvexApi()) as ConvexApiLike | null;
 
-/** Test-only override hook. Pass `null` to restore the real implementations. */
+/**
+ * Test-only override hook. Pass `null` to restore the real
+ * implementations. For `convexClient` / `convexApi`, pass the literal
+ * string `'force-null'` to make the getter return null without falling
+ * through to the production importer (which would crash on missing
+ * `import.meta.env.VITE_CONVEX_URL` in the node:test runner).
+ */
 export function _setDepsForTests(deps: {
   getCurrentClerkUser?: ClerkUserGetter | null;
   getEntitlementState?: EntitlementStateGetter | null;
   hasTier?: HasTierFn | null;
   featureFlagEnabled?: boolean | null;
-  convexClient?: ConvexClientLike | null;
-  convexApi?: ConvexApiLike | null;
+  convexClient?: ConvexClientLike | null | 'force-null';
+  convexApi?: ConvexApiLike | null | 'force-null';
 }): void {
   if (deps.getCurrentClerkUser !== undefined) {
     _clerkUserGetter =
@@ -155,17 +200,25 @@ export function _setDepsForTests(deps: {
   }
   if (deps.convexClient !== undefined) {
     const fake = deps.convexClient;
-    _convexClientGetter =
-      fake === null
-        ? async () => (await _getConvexClient()) as ConvexClientLike | null
-        : async () => fake;
+    if (fake === null) {
+      _convexClientGetter = async () =>
+        (await _getConvexClient()) as ConvexClientLike | null;
+    } else if (fake === 'force-null') {
+      _convexClientGetter = async () => null;
+    } else {
+      _convexClientGetter = async () => fake;
+    }
   }
   if (deps.convexApi !== undefined) {
     const fake = deps.convexApi;
-    _convexApiGetter =
-      fake === null
-        ? async () => (await _getConvexApi()) as ConvexApiLike | null
-        : async () => fake;
+    if (fake === null) {
+      _convexApiGetter = async () =>
+        (await _getConvexApi()) as ConvexApiLike | null;
+    } else if (fake === 'force-null') {
+      _convexApiGetter = async () => null;
+    } else {
+      _convexApiGetter = async () => fake;
+    }
   }
 }
 
@@ -173,6 +226,8 @@ export function _setDepsForTests(deps: {
 export function _resetStateForTests(): void {
   _handoffState = 'idle';
   _handoffGeneration = 0;
+  _handoffRetryAttempt = 0;
+  _initialSnapshotReceived = false;
   _lastKnownSubscriptionSnapshot = null;
   _stopReactiveSubscription();
   _lastSeenUserId = null;
@@ -180,13 +235,54 @@ export function _resetStateForTests(): void {
     document.removeEventListener('visibilitychange', _visibilityRetryListener);
   }
   _visibilityRetryListener = null;
+  if (_crossTabStorageListener && typeof window !== 'undefined') {
+    window.removeEventListener('storage', _crossTabStorageListener);
+  }
+  _crossTabStorageListener = null;
+}
+
+/**
+ * P1 #4 — Test-only recovery hook. If a handoff entered
+ * 'failed-permanent', this clears that latch and resets retry counters
+ * so a follow-up `_emitAuthStateForTests` (or production sign-in) can
+ * re-attempt. Also clears any visibilitychange retry listener.
+ *
+ * Production has no equivalent today: a permanent failure requires the
+ * user to sign out and sign back in to start a fresh handoff
+ * generation.
+ */
+export function _clearFailedHandoffForTests(): void {
+  _handoffRetryAttempt = 0;
+  if (_handoffState === 'failed-permanent' || _handoffState === 'failed') {
+    _handoffState = 'idle';
+  }
+  _clearVisibilityRetryListener();
 }
 
 // ---------------------------------------------------------------------------
 // Module-private state
 // ---------------------------------------------------------------------------
 
-let _handoffState: 'idle' | 'pending' | 'failed' | 'complete' = 'idle';
+/**
+ * Handoff state machine.
+ *
+ *  - 'idle'             : no signed-in user OR initial replay
+ *  - 'pending'          : handoff in flight (await mergeAnonymousLocal)
+ *  - 'failed'           : transient failure (network / convex unavailable);
+ *                         visibilitychange retry scheduled
+ *  - 'complete'         : handoff finished successfully; reactive sub installed
+ *  - 'failed-permanent' : permanent failure (P1 #4 — max-retry exhausted OR
+ *                         server returned a permanent ConvexError such as
+ *                         INPUT_TOO_LARGE / EMPTY_INPUT). Localhost storage
+ *                         cleared; reactive sub installed; manual recovery
+ *                         only via `_clearFailedHandoffForTests()`.
+ */
+let _handoffState:
+  | 'idle'
+  | 'pending'
+  | 'failed'
+  | 'complete'
+  | 'failed-permanent' = 'idle';
 
 /**
  * Incremented on every auth-state transition. Captured by handoff
@@ -194,6 +290,53 @@ let _handoffState: 'idle' | 'pending' | 'failed' | 'complete' = 'idle';
  * Mirrors the cloud-prefs-sync.ts `_authGeneration` pattern.
  */
 let _handoffGeneration = 0;
+
+/**
+ * P1 #4 — counts visibilitychange-driven retries within a single
+ * handoff generation. Reset to 0 when `_runHandoff` is invoked from
+ * `onAuthStateChange` (fresh generation); incremented each time the
+ * visibilitychange retry fires. After `MAX_HANDOFF_RETRIES` (5),
+ * transition to 'failed-permanent' and stop scheduling retries.
+ */
+let _handoffRetryAttempt = 0;
+
+/** Max visibilitychange-driven retry attempts per handoff generation. */
+const MAX_HANDOFF_RETRIES = 5;
+
+/** Exponential backoff schedule (ms) for retry attempt N (0-indexed). */
+const HANDOFF_RETRY_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000];
+
+/**
+ * Test-only override for the backoff schedule. When set, replaces
+ * `HANDOFF_RETRY_BACKOFF_MS` lookup. Tests use `[0, 0, ...]` to make
+ * retries fire immediately (the visibility-event flow remains intact;
+ * only the post-event delay is collapsed).
+ */
+let _handoffBackoffOverride: number[] | null = null;
+
+function _backoffMsFor(attemptIndex: number): number {
+  const schedule = _handoffBackoffOverride ?? HANDOFF_RETRY_BACKOFF_MS;
+  const i = Math.min(attemptIndex, schedule.length - 1);
+  return schedule[i] ?? 0;
+}
+
+/** Test-only — collapse retry backoff so tests don't need to wait seconds. */
+export function _setHandoffBackoffForTests(schedule: number[] | null): void {
+  _handoffBackoffOverride = schedule;
+}
+
+/**
+ * P2 #20 — Tracks whether the reactive subscription has delivered its
+ * first snapshot since `_handoffState` flipped to 'complete'. Used by
+ * `getFollowed()` to fall back to localStorage during the gap between
+ * "complete" being set and the first onUpdate result landing — without
+ * this, an empty-handoff path briefly returns `[]` while the
+ * subscription warms up.
+ *
+ * Reset every time the reactive subscription is (re)started; flipped to
+ * `true` by the onUpdate callback in `_startReactiveSubscription`.
+ */
+let _initialSnapshotReceived = false;
 
 /**
  * User-scoped cache of the most recent listFollowed snapshot. Cleared on
@@ -213,6 +356,15 @@ let _reactiveUnsubscribe: (() => void) | null = null;
 
 /** Pending visibilitychange-retry listener (set when handoffState='failed'). */
 let _visibilityRetryListener: (() => void) | null = null;
+
+/**
+ * P1 #10 — cross-tab `storage` event listener. When Tab-A mutates
+ * `wm-followed-countries-v1`, every other tab fires a `storage` event.
+ * We re-dispatch as `WM_FOLLOWED_COUNTRIES_CHANGED` so FollowButton
+ * subscribers in Tab-B re-render. Installed once via
+ * `installFollowedCountriesAuthListener()`.
+ */
+let _crossTabStorageListener: ((ev: StorageEvent) => void) | null = null;
 
 // ---------------------------------------------------------------------------
 // Feature-flag gate
@@ -379,8 +531,9 @@ export function serviceEntitlementState(): ServiceEntitlementState {
 let _authListenerInstalled = false;
 
 /**
- * Install the auth-state listener once. Called from app boot. Idempotent.
- * Tests don't call this; they drive the auth-state callback manually via
+ * Install the auth-state listener AND the cross-tab `storage` listener
+ * (P1 #10). Idempotent. Called once from app boot. Tests don't call
+ * this; they drive the auth-state callback manually via
  * `_emitAuthStateForTests`.
  */
 export function installFollowedCountriesAuthListener(): void {
@@ -389,6 +542,41 @@ export function installFollowedCountriesAuthListener(): void {
   _subscribeAuthState((state) => {
     void onAuthStateChange(state.user ? { id: state.user.id } : null);
   });
+  _installCrossTabStorageListener();
+}
+
+/**
+ * P1 #10 — re-dispatch `storage` events for our key as
+ * `WM_FOLLOWED_COUNTRIES_CHANGED` so subscribers in other tabs
+ * (FollowButton instances) re-render when this tab mutates the
+ * anonymous-mode list. The browser only fires `storage` in OTHER tabs;
+ * the tab that performed the write doesn't see its own event (this
+ * matches our intent — same-tab updates already dispatch via
+ * `dispatchChanged()` from the write site).
+ *
+ * Test-only callers can also install this via
+ * `_installCrossTabStorageListenerForTests()` to drive the
+ * `_window.dispatchEvent(new StorageEvent(...))` shape directly.
+ */
+function _installCrossTabStorageListener(): void {
+  if (_crossTabStorageListener) return;
+  if (typeof window === 'undefined') return;
+  const handler = (ev: StorageEvent): void => {
+    if (ev.key !== FOLLOWED_COUNTRIES_STORAGE_KEY) return;
+    dispatchChanged();
+  };
+  window.addEventListener('storage', handler);
+  _crossTabStorageListener = handler;
+}
+
+/**
+ * Test-only — install the cross-tab storage listener without going
+ * through `installFollowedCountriesAuthListener` (which also wires the
+ * Clerk-driven auth listener). Lets tests assert the storage→change
+ * fan-out in isolation.
+ */
+export function _installCrossTabStorageListenerForTests(): void {
+  _installCrossTabStorageListener();
 }
 
 /**
@@ -454,6 +642,8 @@ async function onAuthStateChange(
   const gen = _handoffGeneration;
   const userIdAtStart = nextUser.id;
   _handoffState = 'pending';
+  // P1 #4 — fresh handoff generation, reset retry counter.
+  _handoffRetryAttempt = 0;
 
   await _runHandoff(userIdAtStart, gen);
 }
@@ -461,6 +651,17 @@ async function onAuthStateChange(
 /**
  * Core handoff procedure. Extracted so the visibilitychange retry can
  * call it again with a fresh generation capture.
+ *
+ * P1 #3 — catches now use `_extractConvexErrorKind`. Permanent error
+ * kinds (INPUT_TOO_LARGE / EMPTY_INPUT / UNAUTHENTICATED) are NOT
+ * retried; they transition the state machine to 'failed-permanent',
+ * clear localStorage (since the input shape is the problem), and
+ * install the reactive subscription so getFollowed still works.
+ *
+ * P1 #4 — max-retry counter (5) + exponential backoff (1, 2, 4, 8, 16
+ * seconds) gates the visibilitychange retry path. After exhaustion,
+ * the state flips to 'failed-permanent' and no further retries are
+ * scheduled.
  */
 async function _runHandoff(
   userIdAtStart: string,
@@ -478,18 +679,20 @@ async function _runHandoff(
     // Nothing to merge — verify auth is still us, then transition to complete.
     if (!_authStillMatches(userIdAtStart, gen)) return;
     _handoffState = 'complete';
-    _startReactiveSubscription(userIdAtStart, gen);
-    dispatchChanged();
+    // P2 #20 — defer dispatchChanged until the first reactive snapshot
+    // lands (set inside `_startReactiveSubscription`'s onResult). Without
+    // this, an empty-handoff path would dispatch `WM_FOLLOWED_COUNTRIES_CHANGED`
+    // before any subscription data exists, briefly causing FollowButtons
+    // to render as if the list were empty when in fact the snapshot was
+    // simply not yet available. `_startReactiveSubscription` fires the
+    // change event itself once the first onResult arrives.
+    _initialSnapshotReceived = false;
+    void _startReactiveSubscription(userIdAtStart, gen);
     return;
   }
 
   // Step 2: call mergeAnonymousLocal.
-  let result: {
-    totalCount?: number;
-    accepted?: string[];
-    droppedInvalid?: string[];
-    droppedDueToCap?: string[];
-  };
+  let result: ServerMergeAnonymousLocalResult;
   try {
     const client = await _convexClientGetter();
     const api = await _convexApiGetter();
@@ -497,19 +700,36 @@ async function _runHandoff(
       // Convex unavailable — treat as transient failure. Keep localStorage,
       // schedule retry on visibilitychange.
       if (!_authStillMatches(userIdAtStart, gen)) return;
-      _handoffState = 'failed';
-      _scheduleVisibilityChangeRetry(userIdAtStart, gen);
+      _markFailedAndScheduleRetry(userIdAtStart, gen);
       return;
     }
-    result = (await client.mutation(
+    result = await client.mutation(
       api.followedCountries.mergeAnonymousLocal,
       { countries: localList },
-    )) as typeof result;
-  } catch {
-    // Network or 5xx. Verify auth, then mark failed and schedule retry.
+    );
+  } catch (err) {
     if (!_authStillMatches(userIdAtStart, gen)) return;
-    _handoffState = 'failed';
-    _scheduleVisibilityChangeRetry(userIdAtStart, gen);
+    // P1 #3 — branch on ConvexError kind. Permanent kinds skip retry.
+    const kind = _extractConvexErrorKind(err);
+    if (
+      kind === 'INPUT_TOO_LARGE' ||
+      kind === 'EMPTY_INPUT' ||
+      kind === 'UNAUTHENTICATED'
+    ) {
+      // Permanent: the input shape OR the auth identity is the problem.
+      // Clear localStorage so the next sign-in starts clean. Install the
+      // reactive subscription so signed-in reads still work.
+      console.warn(
+        `[followed-countries] handoff permanent failure (kind=${kind}); clearing localStorage`,
+      );
+      removeLocalStorage();
+      _handoffState = 'failed-permanent';
+      _initialSnapshotReceived = false;
+      void _startReactiveSubscription(userIdAtStart, gen);
+      return;
+    }
+    // Transient (network / 5xx). Visibility-retry-gated.
+    _markFailedAndScheduleRetry(userIdAtStart, gen);
     return;
   }
 
@@ -519,17 +739,46 @@ async function _runHandoff(
   // Step 4: success path.
   removeLocalStorage();
   _handoffState = 'complete';
-  _startReactiveSubscription(userIdAtStart, gen);
+  _initialSnapshotReceived = false;
+  void _startReactiveSubscription(userIdAtStart, gen);
+  // Note: we still dispatch immediately here because the localStorage
+  // mutation is itself a state change that subscribers want to know
+  // about (mergeAnonymousLocal cleared it). The subscription's first
+  // snapshot will fire a second event when it arrives.
   dispatchChanged();
 
   // Step 5: surface cap-drop event so the UI can render an upgrade toast.
-  const droppedDueToCap = Array.isArray(result?.droppedDueToCap)
+  const droppedDueToCap = Array.isArray(result.droppedDueToCap)
     ? result.droppedDueToCap
     : [];
-  const accepted = Array.isArray(result?.accepted) ? result.accepted : [];
+  const accepted = Array.isArray(result.accepted) ? result.accepted : [];
   if (droppedDueToCap.length > 0) {
     dispatchCapDrop(accepted.length, droppedDueToCap.length);
   }
+}
+
+/**
+ * P1 #4 — central retry-budget enforcer. Either schedules a
+ * visibilitychange retry (with the exponential-backoff delay scaled by
+ * `_handoffRetryAttempt`) OR transitions to 'failed-permanent' if the
+ * budget is exhausted.
+ */
+function _markFailedAndScheduleRetry(
+  userIdAtStart: string,
+  gen: number,
+): void {
+  if (_handoffRetryAttempt >= MAX_HANDOFF_RETRIES) {
+    console.warn(
+      `[followed-countries] handoff retry budget exhausted (${MAX_HANDOFF_RETRIES}); marking permanent`,
+    );
+    _handoffState = 'failed-permanent';
+    _clearVisibilityRetryListener();
+    _initialSnapshotReceived = false;
+    void _startReactiveSubscription(userIdAtStart, gen);
+    return;
+  }
+  _handoffState = 'failed';
+  _scheduleVisibilityChangeRetry(userIdAtStart, gen);
 }
 
 function _authStillMatches(userIdAtStart: string, gen: number): boolean {
@@ -545,13 +794,26 @@ function _scheduleVisibilityChangeRetry(
 ): void {
   if (typeof document === 'undefined') return;
   _clearVisibilityRetryListener();
+  // P1 #4 — exponential backoff. The visibilitychange event fires when
+  // the tab becomes visible again; we additionally hold off for the
+  // backoff duration before re-running the handoff so a flapping
+  // network doesn't get hammered by a tab-flip-flap pattern.
   const handler = () => {
     if (typeof document !== 'undefined' && document.hidden) return;
     // One-shot — remove and rerun. Only retry if auth still matches AND
     // the handoff generation is still ours; otherwise drop silently.
     _clearVisibilityRetryListener();
     if (!_authStillMatches(userIdAtStart, gen)) return;
-    void _runHandoff(userIdAtStart, gen);
+    const backoffMs = _backoffMsFor(_handoffRetryAttempt);
+    _handoffRetryAttempt += 1;
+    if (backoffMs > 0 && typeof setTimeout !== 'undefined') {
+      setTimeout(() => {
+        if (!_authStillMatches(userIdAtStart, gen)) return;
+        void _runHandoff(userIdAtStart, gen);
+      }, backoffMs);
+    } else {
+      void _runHandoff(userIdAtStart, gen);
+    }
   };
   document.addEventListener('visibilitychange', handler);
   _visibilityRetryListener = handler;
@@ -624,7 +886,7 @@ async function _startReactiveSubscription(
   const teardown = client.onUpdate(
     api.followedCountries.listFollowed,
     {},
-    (result: unknown) => {
+    (result) => {
       // Defensive: drop late callbacks that fire after the subscription
       // was meant to be torn down.
       if (!_authStillMatches(userIdAtStart, gen)) return;
@@ -632,6 +894,9 @@ async function _startReactiveSubscription(
         ? (result.filter((c) => typeof c === 'string') as string[])
         : [];
       _lastKnownSubscriptionSnapshot = { userId: userIdAtStart, countries };
+      // P2 #20 — first snapshot has landed; from now on getFollowed
+      // returns the snapshot authoritatively.
+      _initialSnapshotReceived = true;
       dispatchChanged();
     },
     (err: Error) => {
@@ -692,7 +957,28 @@ export function getFollowed(): string[] {
   // Complete (post-handoff): authoritative is the snapshot. localStorage
   // should already be cleared after a successful handoff, but if for
   // any reason it isn't, the snapshot wins.
-  if (_handoffState === 'complete') return [...snapList];
+  //
+  // P2 #20 — if the handoff is 'complete' but the first reactive
+  // snapshot hasn't landed yet, fall back to localStorage so the UI
+  // doesn't briefly render an empty list during the subscription warm-up
+  // window. (For the empty-handoff path localStorage is already empty;
+  // for the merge-success path localStorage was cleared, so the
+  // fallback returns []. No harm in either case.)
+  if (_handoffState === 'complete') {
+    if (!_initialSnapshotReceived) {
+      return [...new Set([...localList, ...snapList])];
+    }
+    return [...snapList];
+  }
+
+  if (_handoffState === 'failed-permanent') {
+    // Permanent failure: localStorage was cleared (input shape was the
+    // problem). Authoritative source is whatever the reactive
+    // subscription returns. If the subscription hasn't landed yet,
+    // return [] (we won't fall back to localStorage because we cleared
+    // it on purpose).
+    return [...snapList];
+  }
 
   // 'idle' shouldn't be reachable when there's a Clerk user (the
   // listener flips to 'pending' on transition). Fallback: just return
@@ -751,23 +1037,44 @@ export async function addCountry(input: string): Promise<FollowMutationResult> {
 
   // Signed-in & handoff complete → Convex authoritative path.
   if (user) {
-    const existing = getFollowed();
-    if (existing.includes(code)) {
-      return { ok: true };
-    }
+    // P1 #6 — DROPPED: the `if (existing.includes(code)) return {ok:true}`
+    // short-circuit is removed on the signed-in branch. The Convex
+    // mutation is itself idempotent (returns `{idempotent:true}` when
+    // the row already exists) and authoritative; the local snapshot is
+    // eventually consistent and could lie (e.g., another tab just
+    // unfollowed). The anonymous-mode early-return below is preserved
+    // because localStorage IS the source of truth there.
+    // P1 #11 — capture auth identity BEFORE await so a sign-out / user
+    // swap mid-mutation can be detected and surfaced as HANDOFF_PENDING.
+    const userIdAtStart = user.id;
+    const genAtStart = _handoffGeneration;
     try {
       const client = await _convexClientGetter();
       const api = await _convexApiGetter();
+      // P1 #11 — re-verify after the await. If a sign-out / user swap
+      // happened, fall through to HANDOFF_PENDING (do NOT touch
+      // localStorage; the new auth state's listener will handle merge).
+      if (!_authStillMatches(userIdAtStart, genAtStart)) {
+        return { ok: false, reason: 'HANDOFF_PENDING' };
+      }
+      // P1 #5 — when client/api is null in signed-in mode (e.g., Convex
+      // misconfigured for this env), DO NOT silently fall back to
+      // localStorage — that would create a stale partial-write that
+      // never reconciles with the authoritative table. Surface as
+      // HANDOFF_PENDING so the UI shows the syncing tooltip.
       if (!client || !api) {
-        // Convex unavailable in this env — fall back to localStorage so
-        // the UI is at least interactive. (Defensive; production always
-        // has a client when there's a Clerk user.)
-        return _writeLocalStorageAdd(code);
+        return { ok: false, reason: 'HANDOFF_PENDING' };
       }
       await client.mutation(
         api.followedCountries.followCountry,
         { country: code },
       );
+      // P1 #11 — re-verify after the mutation await as well; otherwise
+      // a user-swap between mutation start and resolution could let
+      // user-A's success "land" while we're already user-B.
+      if (!_authStillMatches(userIdAtStart, genAtStart)) {
+        return { ok: false, reason: 'HANDOFF_PENDING' };
+      }
       // The reactive subscription will pick up the new row and dispatch
       // WM_FOLLOWED_COUNTRIES_CHANGED; no need to manually fire here.
       return { ok: true };
@@ -851,18 +1158,31 @@ export async function removeCountry(
   const user = _clerkUserGetter();
 
   if (user) {
-    const existing = getFollowed();
-    if (!existing.includes(code)) return { ok: true };
+    // P1 #6 — DROPPED: the `if (!existing.includes(code)) return {ok:true}`
+    // short-circuit is removed on the signed-in branch. Convex's
+    // `unfollowCountry` is itself idempotent (returns `{idempotent:true}`
+    // on absent rows). The local snapshot is eventually consistent.
+    // P1 #11 — capture auth identity before await for post-await re-check.
+    const userIdAtStart = user.id;
+    const genAtStart = _handoffGeneration;
     try {
       const client = await _convexClientGetter();
       const api = await _convexApiGetter();
+      if (!_authStillMatches(userIdAtStart, genAtStart)) {
+        return { ok: false, reason: 'HANDOFF_PENDING' };
+      }
+      // P1 #5 — same as addCountry: HANDOFF_PENDING when client is null,
+      // never silently fall back to localStorage in signed-in mode.
       if (!client || !api) {
-        return _writeLocalStorageRemove(code);
+        return { ok: false, reason: 'HANDOFF_PENDING' };
       }
       await client.mutation(
         api.followedCountries.unfollowCountry,
         { country: code },
       );
+      if (!_authStillMatches(userIdAtStart, genAtStart)) {
+        return { ok: false, reason: 'HANDOFF_PENDING' };
+      }
       // Reactive subscription will fire the change event.
       return { ok: true };
     } catch (err) {
@@ -920,15 +1240,20 @@ export function subscribe(handler: () => void): () => void {
 export function _getInternalStateForTests(): {
   handoffState: typeof _handoffState;
   handoffGeneration: number;
+  handoffRetryAttempt: number;
+  initialSnapshotReceived: boolean;
   lastKnownSubscriptionSnapshot:
     | { userId: string; countries: string[] }
     | null;
   hasReactiveSubscription: boolean;
   hasVisibilityRetryListener: boolean;
+  hasCrossTabStorageListener: boolean;
 } {
   return {
     handoffState: _handoffState,
     handoffGeneration: _handoffGeneration,
+    handoffRetryAttempt: _handoffRetryAttempt,
+    initialSnapshotReceived: _initialSnapshotReceived,
     lastKnownSubscriptionSnapshot: _lastKnownSubscriptionSnapshot
       ? {
           userId: _lastKnownSubscriptionSnapshot.userId,
@@ -937,6 +1262,7 @@ export function _getInternalStateForTests(): {
       : null,
     hasReactiveSubscription: _reactiveUnsubscribe !== null,
     hasVisibilityRetryListener: _visibilityRetryListener !== null,
+    hasCrossTabStorageListener: _crossTabStorageListener !== null,
   };
 }
 
@@ -955,5 +1281,6 @@ export function _pushSubscriptionSnapshotForTests(
   const current = _clerkUserGetter();
   if (!current || current.id !== userId) return;
   _lastKnownSubscriptionSnapshot = { userId, countries: [...countries] };
+  _initialSnapshotReceived = true;
   dispatchChanged();
 }
