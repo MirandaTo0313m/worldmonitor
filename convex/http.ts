@@ -721,7 +721,7 @@ http.route({
         headers: { "Content-Type": "application/json" },
       });
     }
-    let body: { userId?: string };
+    let body: { userId?: unknown };
     try {
       body = await request.json() as typeof body;
     } catch {
@@ -730,7 +730,14 @@ http.route({
         headers: { "Content-Type": "application/json" },
       });
     }
-    if (!body.userId) {
+    // P2 #19 — Mirror /relay/user-preferences validation rigor: userId
+    // must be a non-empty string with bounded length (Clerk subjects are
+    // short, ~30 chars; cap at 256 defensively).
+    if (
+      typeof body.userId !== "string" ||
+      body.userId.length === 0 ||
+      body.userId.length > 256
+    ) {
       return new Response(JSON.stringify({ error: "userId required" }), {
         status: 400,
         headers: { "Content-Type": "application/json" },

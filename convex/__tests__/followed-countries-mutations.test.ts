@@ -8,6 +8,7 @@ import {
   MAX_MERGE_INPUT,
 } from "../constants";
 import { _ISO2_REGISTRY_FOR_TESTS, isValidIso2 } from "../lib/iso2";
+import { ISO2_TO_ISO3 } from "../../src/utils/country-codes";
 
 const modules = import.meta.glob("../**/*.ts");
 
@@ -137,6 +138,18 @@ describe("iso2 registry — sanity & boundary cases", () => {
     // `src/utils/country-codes.ts::ISO2_TO_ISO3` together.
     expect(_ISO2_REGISTRY_FOR_TESTS.size).toBe(239);
   });
+
+  test("registry === Object.keys(ISO2_TO_ISO3) (set equality, not size only)", () => {
+    // P2 #13 — Catches drift where one registry has, e.g., 'XK' and the
+    // other has 'EU' (same size, different content). Set-equality is the
+    // only way to prove the two are in true lockstep.
+    const serverSet = _ISO2_REGISTRY_FOR_TESTS;
+    const clientSet = new Set(Object.keys(ISO2_TO_ISO3));
+    const onlyInServer = [...serverSet].filter((c) => !clientSet.has(c));
+    const onlyInClient = [...clientSet].filter((c) => !serverSet.has(c));
+    expect(onlyInServer).toEqual([]);
+    expect(onlyInClient).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -238,6 +251,31 @@ describe("followCountry — free-tier cap", () => {
         country: "FR",
       }),
     ).rejects.toThrow(/FREE_CAP/);
+  });
+});
+
+describe("followCountry — tier-first skip-collect optimization (P3 #21)", () => {
+  test("PRO user with many existing rows is never blocked by FREE_CAP — collect() not called for cap check", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+    // Hand-seed 10 rows (> FREE_TIER_FOLLOW_LIMIT) to prove the PRO path
+    // doesn't inspect the existing row count for cap enforcement.
+    const seedCodes = ["GB", "JP", "DE", "FR", "IT", "ES", "PT", "NL", "BE", "CH"];
+    await t.run(async (ctx) => {
+      for (const country of seedCodes) {
+        await ctx.db.insert("followedCountries", {
+          userId: USER_A.subject,
+          country,
+          addedAt: Date.now(),
+        });
+      }
+    });
+    // 11th follow should still succeed: PRO has no cap.
+    const result = await asUser.mutation(api.followedCountries.followCountry, {
+      country: "US",
+    });
+    expect(result).toEqual({ ok: true, idempotent: false });
   });
 });
 

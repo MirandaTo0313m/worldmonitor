@@ -158,19 +158,24 @@ export const followCountry = mutation({
       return { ok: true, idempotent: true };
     }
 
-    const userRows = await ctx.db
-      .query("followedCountries")
-      .withIndex("by_user", (q) => q.eq("userId", userId))
-      .collect();
-    const currentCount = userRows.length;
-
+    // P3 #21 — Tier-first skip-collect optimization.
+    // PRO users have no cap, so we can skip the O(N) `.collect()` of all
+    // user rows entirely (the count is only used for the FREE_CAP check).
+    // For free users the count is required to enforce the cap.
     const tier = await readEntitlementTier(ctx, userId);
-    if (tier < 1 && currentCount >= FREE_TIER_FOLLOW_LIMIT) {
-      throw new ConvexError({
-        kind: "FREE_CAP",
-        currentCount,
-        limit: FREE_TIER_FOLLOW_LIMIT,
-      });
+    if (tier < 1) {
+      const userRows = await ctx.db
+        .query("followedCountries")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .collect();
+      const currentCount = userRows.length;
+      if (currentCount >= FREE_TIER_FOLLOW_LIMIT) {
+        throw new ConvexError({
+          kind: "FREE_CAP",
+          currentCount,
+          limit: FREE_TIER_FOLLOW_LIMIT,
+        });
+      }
     }
 
     await ctx.db.insert("followedCountries", {
@@ -412,12 +417,13 @@ export const listFollowed = query({
  * the input as canonical ISO-2 (rejects `INVALID`, `us`, `XX`, etc.)
  * and returns the count.
  *
- * Privacy floor: counts strictly below `COUNTRY_COUNT_PRIVACY_FLOOR`
- * are returned as `0` to public callers so a single follower can't be
- * deanonymized via this endpoint. The unbucketed count is internally
- * accessible to ops via direct DB reads on the
- * `followedCountriesCounts` table — this floor only applies at the
- * public-query layer.
+ * Privacy floor (P2 #12 — doc/code alignment):
+ *   `raw < COUNTRY_COUNT_PRIVACY_FLOOR` returns 0. With
+ *   COUNTRY_COUNT_PRIVACY_FLOOR=5, counts of 1-4 followers return 0; a
+ *   count of 5 or more is returned exactly. The unbucketed count is
+ *   internally accessible to ops via direct DB reads on the
+ *   `followedCountriesCounts` table — this floor only applies at the
+ *   public-query layer.
  */
 export const countFollowers = query({
   args: { country: v.string() },
@@ -433,6 +439,9 @@ export const countFollowers = query({
       .withIndex("by_country", (q) => q.eq("country", args.country))
       .first();
     const raw = row?.count ?? 0;
+    // `<` is the canonical comparator: returns 0 when count is below
+    // COUNTRY_COUNT_PRIVACY_FLOOR (1-4 followers); count of 5 or more
+    // is returned exactly.
     if (raw < COUNTRY_COUNT_PRIVACY_FLOOR) return 0;
     return raw;
   },

@@ -126,6 +126,53 @@ describe("/relay/followed-countries HTTP action", () => {
     expect(body.error).toBe("userId required");
   });
 
+  test("P2 #19 — empty-string userId → 400", async () => {
+    const t = convexTest(schema, modules);
+    const res = await t.fetch("/relay/followed-countries", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RELAY_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userId: "" }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("userId required");
+  });
+
+  test("P2 #19 — non-string userId (number) → 400", async () => {
+    const t = convexTest(schema, modules);
+    const res = await t.fetch("/relay/followed-countries", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RELAY_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userId: 12345 }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("userId required");
+  });
+
+  test("P2 #19 — oversized userId (>256 chars) → 400", async () => {
+    const t = convexTest(schema, modules);
+    const oversized = "u_".repeat(200); // 400 chars
+    expect(oversized.length).toBeGreaterThan(256);
+    const res = await t.fetch("/relay/followed-countries", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RELAY_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userId: oversized }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("userId required");
+  });
+
   test("invalid JSON body → 400 INVALID_BODY", async () => {
     const t = convexTest(schema, modules);
 
