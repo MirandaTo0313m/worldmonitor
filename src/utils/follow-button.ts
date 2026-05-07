@@ -288,6 +288,15 @@ export function renderFollowButton(
     html: initialHtml,
     attach(host: HTMLElement): () => void {
       let tornDown = false;
+      // P2 #17 — inFlight latch prevents rapid double-click duplicate
+      // mutations. Set true at click-handler entry, cleared in finally
+      // after the awaited mutation resolves. While true, additional
+      // clicks are dropped silently (no second addCountry/removeCountry
+      // is fired). Without this, a double-click on an unfollowed button
+      // would produce TWO follows that both succeed (the service is
+      // idempotent on (user, country) but the second add is wasted
+      // network + counter increment work).
+      let inFlight = false;
 
       // Re-render uses host.innerHTML (the host is dedicated to this
       // button; it's not a delegated container). This keeps the
@@ -319,8 +328,16 @@ export function renderFollowButton(
           // make the click a no-op regardless.
           return;
         }
+        // P2 #17 — drop duplicate clicks while a mutation is in flight.
+        if (inFlight) {
+          ev.preventDefault();
+          return;
+        }
         ev.preventDefault();
-        void onClick(props, () => rerender());
+        inFlight = true;
+        void onClick(props, () => rerender()).finally(() => {
+          inFlight = false;
+        });
       };
 
       host.addEventListener('click', clickHandler);
@@ -351,6 +368,19 @@ export function renderFollowButton(
       };
     },
   };
+}
+
+/**
+ * P2 #16 — exhaustiveness helper. Used in the `onClick` switch on
+ * `FollowMutationResult.reason`. If a future contributor adds a new
+ * reason variant to `FollowMutationResult` and forgets to add a
+ * `case` here, TypeScript will fail to compile because the residual
+ * `result.reason` won't narrow to `never`. The runtime fallback only
+ * fires for an actual untyped value (e.g., from a malformed test
+ * fake) — production code paths are caught at typecheck time.
+ */
+function assertNever(value: never, where = 'follow-button'): never {
+  throw new Error(`[${where}] unhandled discriminant: ${String(value)}`);
 }
 
 async function onClick(
@@ -410,5 +440,11 @@ async function onClick(
         '[follow-button] anonymous storage full — cannot persist follow',
       );
       return;
+    default:
+      // P2 #16 — exhaustiveness: when every variant is handled above,
+      // `result` narrows to `never` here. Adding a new reason to
+      // `FollowMutationResult` widens the residual type and produces
+      // a TS2345 ('not assignable to never') at the call site below.
+      assertNever(result);
   }
 }
