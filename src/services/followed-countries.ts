@@ -46,6 +46,7 @@ import { subscribeAuthState as _subscribeAuthState } from './auth-state';
 import {
   getConvexClient as _getConvexClient,
   getConvexApi as _getConvexApi,
+  waitForConvexAuth as _waitForConvexAuth,
 } from './convex-client';
 import type { MergeAnonymousLocalResult as ServerMergeAnonymousLocalResult } from '../../convex/followedCountries';
 
@@ -167,6 +168,25 @@ let _convexClientGetter: () => Promise<ConvexClientLike | null> = async () =>
   (await _getConvexClient()) as ConvexClientLike | null;
 let _convexApiGetter: () => Promise<ConvexApiLike | null> = async () =>
   (await _getConvexApi()) as ConvexApiLike | null;
+/**
+ * Codex round-4 P1: defer the merge until Convex auth is ready. The
+ * Clerk auth-state listener fires the moment the JWT is in the Clerk
+ * client, but Convex's `setAuth` callback runs async (the next event
+ * loop tick after `client.setAuth(...)` is invoked). Without this
+ * gate, `mergeAnonymousLocal` can fire before Convex sees the
+ * identity → throws ConvexError({kind:'UNAUTHENTICATED'}). That kind
+ * was previously classified as PERMANENT, which clears localStorage
+ * and loses the anonymous follows on every transient auth lag.
+ *
+ * Resolves to `true` when Convex auth lands; `false` if it doesn't
+ * within the timeout window (which still falls through to the
+ * mergeAnonymousLocal call — the catch path now treats UNAUTHENTICATED
+ * as transient and the visibilitychange retry will succeed once
+ * Convex catches up).
+ */
+let _waitForConvexAuthFn: (timeoutMs?: number) => Promise<boolean> = (
+  timeoutMs,
+) => _waitForConvexAuth(timeoutMs);
 
 /**
  * Test-only override hook. Pass `null` to restore the real
@@ -182,6 +202,7 @@ export function _setDepsForTests(deps: {
   featureFlagEnabled?: boolean | null;
   convexClient?: ConvexClientLike | null | 'force-null';
   convexApi?: ConvexApiLike | null | 'force-null';
+  waitForConvexAuth?: ((timeoutMs?: number) => Promise<boolean>) | null;
 }): void {
   if (deps.getCurrentClerkUser !== undefined) {
     _clerkUserGetter =
@@ -219,6 +240,10 @@ export function _setDepsForTests(deps: {
     } else {
       _convexApiGetter = async () => fake;
     }
+  }
+  if (deps.waitForConvexAuth !== undefined) {
+    _waitForConvexAuthFn =
+      deps.waitForConvexAuth ?? ((tm) => _waitForConvexAuth(tm));
   }
 }
 
@@ -653,10 +678,27 @@ async function onAuthStateChange(
  * call it again with a fresh generation capture.
  *
  * P1 #3 — catches now use `_extractConvexErrorKind`. Permanent error
- * kinds (INPUT_TOO_LARGE / EMPTY_INPUT / UNAUTHENTICATED) are NOT
- * retried; they transition the state machine to 'failed-permanent',
- * clear localStorage (since the input shape is the problem), and
- * install the reactive subscription so getFollowed still works.
+ * kinds (INPUT_TOO_LARGE / EMPTY_INPUT) are NOT retried; they transition
+ * the state machine to 'failed-permanent', clear localStorage (since
+ * the input shape is the problem), and install the reactive
+ * subscription so getFollowed still works.
+ *
+ * Codex round-4 P1 — UNAUTHENTICATED is now TRANSIENT, not permanent.
+ * `subscribeAuthState` emits the current signed-in state IMMEDIATELY on
+ * subscribe, but Convex auth is not yet ready (the JWT hasn't been
+ * attached to the Convex client). `mergeAnonymousLocal` fires before
+ * Convex sees the auth → throws UNAUTHENTICATED. The previous
+ * classification cleared localStorage, losing anonymous follows on
+ * every transient auth lag. Two-part fix:
+ *   (a) await `_waitForConvexAuthFn()` BEFORE the mutation call so the
+ *       race usually doesn't fire at all;
+ *   (b) treat UNAUTHENTICATED as transient if it still fires (e.g.,
+ *       waitForConvexAuth timed out, or Convex auth dropped mid-call) —
+ *       visibilitychange + max-retry path will re-attempt once Convex
+ *       auth lands. UNAUTHENTICATED IS counted toward the max-retry
+ *       budget (it's the same state-machine state as a network
+ *       failure); a real persistent auth mismatch will eventually
+ *       transition to 'failed-permanent' after MAX_HANDOFF_RETRIES.
  *
  * P1 #4 — max-retry counter (5) + exponential backoff (1, 2, 4, 8, 16
  * seconds) gates the visibilitychange retry path. After exhaustion,
@@ -703,6 +745,16 @@ async function _runHandoff(
       _markFailedAndScheduleRetry(userIdAtStart, gen);
       return;
     }
+    // Codex round-4 P1 — defer the merge until Convex auth has landed.
+    // Without this, mergeAnonymousLocal can fire BEFORE Convex sees the
+    // identity (Clerk emits the signed-in state immediately; Convex's
+    // setAuth callback runs on the next event-loop tick) and the server
+    // throws UNAUTHENTICATED. waitForConvexAuth resolves to true once
+    // the server confirms the client is authenticated, false on timeout.
+    // On timeout we still attempt the call — the catch below will treat
+    // any resulting UNAUTHENTICATED as transient and schedule a retry.
+    await _waitForConvexAuthFn();
+    if (!_authStillMatches(userIdAtStart, gen)) return;
     result = await client.mutation(
       api.followedCountries.mergeAnonymousLocal,
       { countries: localList },
@@ -710,15 +762,15 @@ async function _runHandoff(
   } catch (err) {
     if (!_authStillMatches(userIdAtStart, gen)) return;
     // P1 #3 — branch on ConvexError kind. Permanent kinds skip retry.
+    // Codex round-4 P1 — UNAUTHENTICATED is no longer permanent; it's
+    // the canonical signal of "Convex auth not yet attached" and the
+    // visibilitychange retry will succeed once auth lands.
     const kind = _extractConvexErrorKind(err);
-    if (
-      kind === 'INPUT_TOO_LARGE' ||
-      kind === 'EMPTY_INPUT' ||
-      kind === 'UNAUTHENTICATED'
-    ) {
-      // Permanent: the input shape OR the auth identity is the problem.
-      // Clear localStorage so the next sign-in starts clean. Install the
-      // reactive subscription so signed-in reads still work.
+    if (kind === 'INPUT_TOO_LARGE' || kind === 'EMPTY_INPUT') {
+      // Permanent: the input shape is the problem (over-large array OR
+      // empty array). Clear localStorage so the next sign-in starts
+      // clean. Install the reactive subscription so signed-in reads
+      // still work.
       console.warn(
         `[followed-countries] handoff permanent failure (kind=${kind}); clearing localStorage`,
       );
@@ -728,7 +780,9 @@ async function _runHandoff(
       void _startReactiveSubscription(userIdAtStart, gen);
       return;
     }
-    // Transient (network / 5xx). Visibility-retry-gated.
+    // Transient (network / 5xx / UNAUTHENTICATED-while-Convex-catches-up).
+    // Visibility-retry-gated; counted toward MAX_HANDOFF_RETRIES so a
+    // genuinely-stuck auth mismatch eventually flips to failed-permanent.
     _markFailedAndScheduleRetry(userIdAtStart, gen);
     return;
   }

@@ -834,7 +834,13 @@ describe('Phase2 — P1 #3 permanent ConvexError kinds skip retry, transition to
     assert.equal(_getInternalStateForTests().hasVisibilityRetryListener, false);
   });
 
-  it("UNAUTHENTICATED → 'failed-permanent'; localStorage cleared", async () => {
+  it("UNAUTHENTICATED is TRANSIENT (Codex round-4 P1) → 'failed' + retry, NOT 'failed-permanent'; localStorage retained", async () => {
+    // Previously UNAUTHENTICATED was classified as permanent, which
+    // cleared localStorage on every transient auth lag (Clerk emits
+    // signed-in state IMMEDIATELY but Convex's setAuth callback runs
+    // on the next tick). This test pins the new behavior: UNAUTHENTICATED
+    // is treated as transient, the visibilitychange retry stays armed,
+    // and localStorage is retained so the retry can succeed.
     setLocalStorageList(['US']);
     const e = new Error('ConvexError: UNAUTHENTICATED');
     e.data = { kind: 'UNAUTHENTICATED' };
@@ -843,8 +849,14 @@ describe('Phase2 — P1 #3 permanent ConvexError kinds skip retry, transition to
 
     await _emitAuthStateForTests({ id: 'user_un' });
     await flushMicrotasks();
-    assert.equal(_getInternalStateForTests().handoffState, 'failed-permanent');
-    assert.equal(getLocalStorageRaw(), null);
+    const state = _getInternalStateForTests();
+    assert.equal(state.handoffState, 'failed', 'UNAUTHENTICATED is transient');
+    assert.equal(state.hasVisibilityRetryListener, true, 'retry stays armed');
+    assert.notEqual(
+      getLocalStorageRaw(),
+      null,
+      'localStorage retained for retry',
+    );
   });
 
   it('plain network error (no ConvexError data) → still transient: failed + retry scheduled', async () => {
@@ -1082,5 +1094,185 @@ describe('Phase2 — P2 #20 empty-handoff path does not dispatch change before s
     assert.equal(events, 1, 'change event fires after first snapshot');
 
     unsub();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex round-4 P1 — UNAUTHENTICATED is transient: handoff retries once
+// Convex auth lands; localStorage is NEVER cleared on UNAUTHENTICATED.
+//
+// `subscribeAuthState` emits the current signed-in state IMMEDIATELY on
+// subscribe, but Convex auth is not yet ready (the JWT hasn't been
+// attached to the Convex client). `mergeAnonymousLocal` fires before
+// Convex sees the auth and throws ConvexError({kind:'UNAUTHENTICATED'}).
+// The previous classification cleared localStorage on every transient
+// auth lag → anonymous follows lost on every sign-in.
+// ---------------------------------------------------------------------------
+
+describe('Codex round-4 P1 — UNAUTHENTICATED transient retry path', () => {
+  it('first call throws UNAUTHENTICATED, visibility retry succeeds → final state has merged data, localStorage cleared, no follows lost', async () => {
+    setLocalStorageList(['US', 'GB']);
+
+    // Inline fake: throws UNAUTHENTICATED on the FIRST mergeAnonymousLocal
+    // call, then succeeds (no rejection) on subsequent calls. This
+    // simulates the exact production race: Clerk fires "signed in" first
+    // tick, Convex setAuth resolves on a later tick, the visibility
+    // retry then succeeds.
+    let rows = [];
+    let listCb = null;
+    let mergeCalls = 0;
+    const ConvexErrorCtor = class extends Error {
+      constructor(data) {
+        super(`ConvexError: ${data.kind}`);
+        this.data = data;
+      }
+    };
+    const fake = {
+      async mutation(ref, args) {
+        if (ref === FAKE_API.followedCountries.mergeAnonymousLocal) {
+          mergeCalls += 1;
+          if (mergeCalls === 1) {
+            throw new ConvexErrorCtor({ kind: 'UNAUTHENTICATED' });
+          }
+          // Second call: succeed (Convex auth has now landed).
+          const accepted = [];
+          for (const c of args.countries) {
+            if (!rows.find((r) => r.country === c)) {
+              rows.push({ country: c, addedAt: Date.now() + accepted.length });
+              accepted.push(c);
+            }
+          }
+          if (listCb) {
+            const sorted = [...rows].sort((a, b) => a.addedAt - b.addedAt).map((r) => r.country);
+            listCb(sorted);
+          }
+          return { totalCount: rows.length, accepted, droppedInvalid: [], droppedDueToCap: [] };
+        }
+        throw new Error(`unmocked: ${String(ref)}`);
+      },
+      onUpdate(ref, _args, cb) {
+        if (ref === FAKE_API.followedCountries.listFollowed) {
+          listCb = cb;
+          Promise.resolve().then(() => {
+            const sorted = [...rows].sort((a, b) => a.addedAt - b.addedAt).map((r) => r.country);
+            if (listCb === cb) cb(sorted);
+          });
+          return () => { if (listCb === cb) listCb = null; };
+        }
+        throw new Error(`unmocked subscription: ${String(ref)}`);
+      },
+    };
+    setupSignedIn('user_un_retry', { tier: 1, fakeClient: fake });
+
+    // First handoff fails with UNAUTHENTICATED → state goes to 'failed'
+    // (transient), not 'failed-permanent'. localStorage is RETAINED.
+    await _emitAuthStateForTests({ id: 'user_un_retry' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed');
+    assert.equal(
+      _getInternalStateForTests().hasVisibilityRetryListener,
+      true,
+      'visibility retry armed',
+    );
+    assert.notEqual(getLocalStorageRaw(), null, 'localStorage retained');
+
+    // Trigger the visibilitychange retry. The fake's second call succeeds.
+    _document.dispatchEvent(new Event('visibilitychange'));
+    await flushMicrotasks();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    // Final state: merged data lives in the fake server, localStorage
+    // is cleared, handoff completed.
+    assert.equal(
+      _getInternalStateForTests().handoffState,
+      'complete',
+      'retry completes the handoff',
+    );
+    assert.equal(getLocalStorageRaw(), null, 'localStorage cleared on success');
+    assert.deepEqual(
+      rows.map((r) => r.country).sort(),
+      ['GB', 'US'],
+      'merged data reaches the server',
+    );
+    assert.equal(mergeCalls, 2, 'merge attempted exactly twice');
+  });
+
+  it('UNAUTHENTICATED IS counted toward MAX_HANDOFF_RETRIES — 5 consecutive UNAUTHENTICATED throws → failed-permanent', async () => {
+    // A genuinely-stuck auth mismatch (e.g., Clerk says signed-in but
+    // Convex never sees the JWT for some real reason) MUST eventually
+    // transition to failed-permanent rather than retry forever. The
+    // budget MUST be the same MAX_HANDOFF_RETRIES used by the network-
+    // failure path.
+    setLocalStorageList(['US']);
+    const e = new Error('ConvexError: UNAUTHENTICATED');
+    e.data = { kind: 'UNAUTHENTICATED' };
+    const fake = makeFakeConvex({ tier: 1, mergeRejection: e });
+    setupSignedIn('user_un_max', { tier: 1, fakeClient: fake });
+
+    await _emitAuthStateForTests({ id: 'user_un_max' });
+    await flushMicrotasks();
+    assert.equal(_getInternalStateForTests().handoffState, 'failed');
+
+    // Fire visibilitychange MAX_HANDOFF_RETRIES (5) times. Each retry
+    // throws UNAUTHENTICATED again. After exhausting the budget, the
+    // state flips to failed-permanent.
+    for (let i = 0; i < 5; i++) {
+      _document.dispatchEvent(new Event('visibilitychange'));
+      await flushMicrotasks();
+      await flushMicrotasks();
+    }
+    assert.equal(
+      _getInternalStateForTests().handoffState,
+      'failed-permanent',
+      'auth-permanent after retry budget exhausted',
+    );
+    assert.equal(
+      _getInternalStateForTests().hasVisibilityRetryListener,
+      false,
+    );
+  });
+
+  it('waitForConvexAuth is awaited BEFORE the merge call, so the typical UNAUTHENTICATED race never fires', async () => {
+    // Drive the deferred-by-auth flow: waitForConvexAuth resolves only
+    // after a small delay; the fake captures whether mergeAnonymousLocal
+    // fired BEFORE or AFTER the waitForConvexAuth resolution.
+    setLocalStorageList(['US']);
+    let authResolved = false;
+    let mergeCalledWhileAuthPending = false;
+    const fake = makeFakeConvex({ tier: 1 });
+    // Wrap the fake's mutation to observe call ordering vs. auth-resolved.
+    const innerMutation = fake.mutation.bind(fake);
+    fake.mutation = async function (ref, args) {
+      if (ref === FAKE_API.followedCountries.mergeAnonymousLocal && !authResolved) {
+        mergeCalledWhileAuthPending = true;
+      }
+      return innerMutation(ref, args);
+    };
+    _setDepsForTests({
+      getCurrentClerkUser: () => ({ id: 'user_wait' }),
+      getEntitlementState: () => ({ features: { tier: 1 } }),
+      hasTier: (n) => n <= 1,
+      featureFlagEnabled: true,
+      convexClient: fake,
+      convexApi: FAKE_API,
+      waitForConvexAuth: async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        authResolved = true;
+        return true;
+      },
+    });
+
+    await _emitAuthStateForTests({ id: 'user_wait' });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    assert.equal(_getInternalStateForTests().handoffState, 'complete');
+    assert.equal(
+      mergeCalledWhileAuthPending,
+      false,
+      'merge fires only AFTER waitForConvexAuth resolves',
+    );
+    assert.equal(authResolved, true);
   });
 });
