@@ -1224,18 +1224,173 @@ describe("sharded lock — pre-seed & no-meta-dup invariant", () => {
     ).rejects.toThrow(/SHARDS_NOT_SEEDED/);
   });
 
-  test("public seedShards mutation (operator CLI surface) is idempotent", async () => {
-    const t = await makeT();
-    // Public seedShards must be reachable from `t.mutation` (operator runs
-    // it via `npx convex run followedCountries:seedShards`).
-    const r = await t.mutation(api.followedCountries.seedShards, {});
-    expect(r).toEqual({ seeded: 0 });
+  test("public seedShards mutation is no longer exported (security: anyone-can-seed surface removed)", async () => {
+    // Codex round-3 P1 fix: the `seedShards` PUBLIC mutation was removed
+    // because (a) it had no auth gate (any browser ConvexHttpClient could
+    // call it) and (b) the only legitimate caller is the post-deploy CI
+    // step which uses `npx convex run --prod followedCountries:_seedShards`
+    // — and `npx convex run` can target internal functions directly. So
+    // the public surface was deadweight + a hazard.
+    //
+    // Assertion: the source file does NOT export a top-level
+    // `seedShards` (would surface as `export const seedShards = mutation`
+    // or `export const seedShards = internalMutation`). We assert against
+    // source text rather than `api.followedCountries.seedShards` because
+    // the Convex `api` proxy returns FunctionReference objects whose
+    // tostring/inspect path is not pretty-format-safe. The compile-time
+    // typecheck is the primary gate; this is a belt-and-suspenders
+    // runtime guard against accidental re-export.
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    const source = await fs.readFile(
+      path.join(here, "..", "followedCountries.ts"),
+      "utf8",
+    );
+    // Match `export const seedShards = ...` at column 0 (anchored to a
+    // line start); the internal helper is `_seedShards` and is allowed.
+    expect(/^export const seedShards\s*=/m.test(source)).toBe(false);
+  });
 
-    // Total still SHARD_COUNT.
-    const total = await t.run(async (ctx) => {
+  test("readShardOrThrow tolerates duplicate shard rows (uses .first(), not .unique())", async () => {
+    // Concurrent-seed race tolerance: two simultaneous _seedShards calls
+    // against an empty table can produce duplicate rows for the same
+    // shardId. `readShardOrThrow` uses `.first()` so the mutation never
+    // throws. `.first()` returns the oldest row by `_creationTime`
+    // (Convex's automatic index tiebreaker), so all parallel mutations
+    // for users hashing to this shard pick the SAME row — OCC
+    // serialization is preserved during the duplicate-window. The
+    // `_dedupeShards` cron then removes extras within 24h.
+    const t = await makeT();
+    await seedProEntitlement(t, USER_A.subject);
+    const userShard = userIdToShard(USER_A.subject);
+
+    // Inject a duplicate row for the user's shard.
+    await t.run(async (ctx) => {
+      await ctx.db.insert("followedCountriesShards", {
+        shardId: userShard,
+        lastTouchedAt: Date.now(),
+      });
+    });
+
+    // Confirm the duplicate exists (sanity-check the test setup).
+    const dupCount = await t.run(async (ctx) => {
       const rows = await ctx.db
         .query("followedCountriesShards")
+        .withIndex("by_shard", (q) => q.eq("shardId", userShard))
         .collect();
+      return rows.length;
+    });
+    expect(dupCount).toBe(2);
+
+    // Mutation MUST succeed despite the duplicate.
+    const asUser = t.withIdentity(USER_A);
+    const result = await asUser.mutation(
+      api.followedCountries.followCountry,
+      { country: "US" },
+    );
+    expect(result).toEqual({ ok: true, idempotent: false });
+
+    // Counter parity: row inserted, counter incremented, meta count = 1.
+    expect(await readUserFollows(t, USER_A.subject)).toEqual(["US"]);
+    expect(await readCounter(t, "US")).toBe(1);
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+  });
+
+  test("_dedupeShards: zero duplicates → no-op", async () => {
+    const t = await makeT();
+    const result = await t.mutation(
+      internal.followedCountries._dedupeShards,
+      {},
+    );
+    expect(result).toEqual({ deleted: 0 });
+
+    // Total still SHARD_COUNT, no row dropped.
+    const total = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("followedCountriesShards").collect();
+      return rows.length;
+    });
+    expect(total).toBe(SHARD_COUNT);
+  });
+
+  test("_dedupeShards: N duplicates → reduces to 1 row per shardId, keeps oldest", async () => {
+    const t = await makeT();
+
+    // Inject duplicates for shardIds 0 and 5 (one extra each), and a
+    // double-duplicate for shardId 7 (two extras). We track the
+    // `_creationTime` of the oldest — that's the row that MUST survive.
+    const oldestIds: Record<number, string> = {};
+    await t.run(async (ctx) => {
+      for (const sid of [0, 5, 7]) {
+        const existing = await ctx.db
+          .query("followedCountriesShards")
+          .withIndex("by_shard", (q) => q.eq("shardId", sid))
+          .first();
+        if (existing) oldestIds[sid] = existing._id;
+      }
+      // Inject extras AFTER reading the oldest so `_creationTime`
+      // ordering is unambiguous.
+      await ctx.db.insert("followedCountriesShards", {
+        shardId: 0,
+        lastTouchedAt: Date.now(),
+      });
+      await ctx.db.insert("followedCountriesShards", {
+        shardId: 5,
+        lastTouchedAt: Date.now(),
+      });
+      await ctx.db.insert("followedCountriesShards", {
+        shardId: 7,
+        lastTouchedAt: Date.now(),
+      });
+      await ctx.db.insert("followedCountriesShards", {
+        shardId: 7,
+        lastTouchedAt: Date.now(),
+      });
+    });
+
+    const result = await t.mutation(
+      internal.followedCountries._dedupeShards,
+      {},
+    );
+    // 1 + 1 + 2 = 4 extras deleted.
+    expect(result).toEqual({ deleted: 4 });
+
+    // Total back to SHARD_COUNT.
+    const total = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("followedCountriesShards").collect();
+      return rows.length;
+    });
+    expect(total).toBe(SHARD_COUNT);
+
+    // Each shardId now has exactly 1 row and the survivor is the
+    // pre-existing oldest one.
+    for (const sid of [0, 5, 7]) {
+      const rows = await t.run(async (ctx) => {
+        return await ctx.db
+          .query("followedCountriesShards")
+          .withIndex("by_shard", (q) => q.eq("shardId", sid))
+          .collect();
+      });
+      expect(rows.length).toBe(1);
+      expect(rows[0]._id).toBe(oldestIds[sid]);
+    }
+  });
+
+  test("_seedShards is idempotent under back-to-back concurrent re-run", async () => {
+    // Models the concurrent-seed race: two simultaneous calls. Both
+    // observe pre-seed state; both insert nothing because makeT() already
+    // seeded; both return { seeded: 0 }. Total row count is unchanged.
+    const t = await makeT();
+    const [a, b] = await Promise.all([
+      t.mutation(internal.followedCountries._seedShards, {}),
+      t.mutation(internal.followedCountries._seedShards, {}),
+    ]);
+    expect(a).toEqual({ seeded: 0 });
+    expect(b).toEqual({ seeded: 0 });
+
+    const total = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("followedCountriesShards").collect();
       return rows.length;
     });
     expect(total).toBe(SHARD_COUNT);

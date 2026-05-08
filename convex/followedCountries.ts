@@ -55,6 +55,18 @@ async function readEntitlementTier(
  * same-user mutations against an ALREADY-EXISTING document — closing the
  * nested TOCTOU on the lazy-created `followedCountriesUserMeta` row.
  *
+ * Uses `.first()` (not `.unique()`) so duplicate shard rows for the same
+ * `shardId` — possible from a concurrent-seed race in `_seedShards`
+ * before the daily `_dedupeShards` cron self-heals — never throw.
+ * `.first()` returns rows in `_creationTime` order, so concurrent
+ * mutations all pick the OLDEST duplicate row deterministically. That
+ * means OCC contention is preserved for the duration of the
+ * duplicate-window: every parallel same-user mutation touches the same
+ * single row, so the per-document OCC retry still serializes them. The
+ * `_dedupeShards` cron deletes extras keeping the oldest by
+ * `_creationTime`, restoring exactly one row per `shardId` on the next
+ * daily tick.
+ *
  * See `convex/lib/shards.ts::userIdToShard` for the hash and
  * `convex/constants.ts::SHARD_COUNT` for the fixed shard count.
  */
@@ -66,7 +78,7 @@ async function readShardOrThrow(
   const shard = await ctx.db
     .query("followedCountriesShards")
     .withIndex("by_shard", (q) => q.eq("shardId", shardId))
-    .unique();
+    .first();
   if (!shard) {
     // Operator error — should never happen in production after deploy +
     // the daily `_seedShards` cron. Logged loudly so on-call sees it.
@@ -691,13 +703,29 @@ export const internalListFollowedForUser = internalQuery({
  *
  * Wired into:
  *   - `convex/crons.ts` daily cron (idempotent, cheap — defends against
- *     a deploy-time seed step being skipped).
- *   - `seedShards` public mutation below — admin-runnable to force-seed
- *     after a fresh deploy without waiting for the cron tick.
+ *     a deploy-time seed step being skipped). Runs alongside
+ *     `_dedupeShards` so any concurrent-seed duplicates self-heal within
+ *     24h.
+ *   - `.github/workflows/convex-deploy.yml` post-deploy step — operator
+ *     surface is `npx convex run --prod followedCountries:_seedShards`.
+ *     `npx convex run` targets internal functions by their file:export
+ *     path, so a public-mutation wrapper is unnecessary (and was a
+ *     security hazard — see Codex round-3 P1).
  *
  * Returns `{ seeded: N }` — the number of NEW rows inserted. After
  * steady-state, every call returns `{ seeded: 0 }` and the table has
  * exactly SHARD_COUNT rows.
+ *
+ * Concurrent-seed race: two simultaneous calls against an empty table
+ * both read empty, both compute `have` as empty, and both insert the
+ * full range — producing 128 rows (2 per `shardId`). This is a real
+ * possibility on a re-deploy that races the daily cron. The race is
+ * tolerated rather than prevented: `readShardOrThrow` uses `.first()`
+ * (not `.unique()`), so duplicates never break a follow/unfollow/merge
+ * mutation; `_dedupeShards` runs in the same daily cron and removes
+ * extras, restoring exactly one row per shardId. The user-meta count
+ * remains the authoritative cap denominator, so cap correctness is
+ * unaffected by transient duplicates.
  */
 export const _seedShards = internalMutation({
   args: {},
@@ -722,34 +750,52 @@ export const _seedShards = internalMutation({
 });
 
 /**
- * `seedShards()` — admin-runnable thin wrapper around `_seedShards`.
- * Operators run `npx convex run --prod followedCountries:seedShards`
- * after a fresh deploy to seed the shard table immediately, without
- * waiting for the daily cron. Idempotent — safe to re-run.
+ * `_dedupeShards()` — INTERNAL-ONLY daily cron companion to `_seedShards`.
+ * Walks the `followedCountriesShards` table, groups by `shardId`, and
+ * deletes all but the OLDEST row (by `_creationTime`) for any shardId
+ * with `count > 1`. The "oldest" choice is intentional — under a
+ * concurrent-seed race, the loser's row is what `readShardOrThrow`'s
+ * `.first()` returned to in-flight mutations between the race and this
+ * cleanup, so the oldest row already has the most "real" `lastTouchedAt`
+ * traffic and is the safer survivor.
  *
- * Public so `npx convex run` can target it; the body is identical to the
- * internal version. We keep both because internalMutation is targetable
- * by the cron and public mutation is targetable by the operator CLI;
- * neither alone covers both surfaces cleanly without a wrapper.
+ * After every daily run the table satisfies `count = SHARD_COUNT` AND
+ * `every shardId in [0, SHARD_COUNT)` appears exactly once. Idempotent
+ * in the steady-state (no duplicates → no deletes).
+ *
+ * Returns `{ deleted: N }` — the number of duplicate rows removed.
  */
-export const seedShards = mutation({
+export const _dedupeShards = internalMutation({
   args: {},
-  handler: async (ctx): Promise<{ seeded: number }> => {
-    const existing = await ctx.db
-      .query("followedCountriesShards")
-      .collect();
-    const have = new Set<number>(existing.map((r) => r.shardId));
-    const now = Date.now();
-    let seeded = 0;
-    for (let i = 0; i < SHARD_COUNT; i++) {
-      if (!have.has(i)) {
-        await ctx.db.insert("followedCountriesShards", {
-          shardId: i,
-          lastTouchedAt: now,
-        });
-        seeded += 1;
+  handler: async (ctx): Promise<{ deleted: number }> => {
+    const all = await ctx.db.query("followedCountriesShards").collect();
+    // Group by shardId; for each group with > 1 row, keep the oldest by
+    // `_creationTime` and delete the rest.
+    const byShard = new Map<number, Doc<"followedCountriesShards">[]>();
+    for (const row of all) {
+      const list = byShard.get(row.shardId);
+      if (list) {
+        list.push(row);
+      } else {
+        byShard.set(row.shardId, [row]);
       }
     }
-    return { seeded };
+    let deleted = 0;
+    for (const rows of byShard.values()) {
+      if (rows.length <= 1) continue;
+      // Sort ascending by `_creationTime` — oldest first.
+      rows.sort((a, b) => a._creationTime - b._creationTime);
+      // Keep [0]; delete [1..]. `noUncheckedIndexedAccess` requires the
+      // explicit `extra !== undefined` guard even though the loop bound
+      // makes it unreachable.
+      for (let i = 1; i < rows.length; i++) {
+        const extra = rows[i];
+        if (extra !== undefined) {
+          await ctx.db.delete(extra._id);
+          deleted += 1;
+        }
+      }
+    }
+    return { deleted };
   },
 });
