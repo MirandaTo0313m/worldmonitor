@@ -1,16 +1,32 @@
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import schema from "../schema";
-import { api } from "../_generated/api";
+import { api, internal } from "../_generated/api";
 import {
   COUNTRY_COUNT_PRIVACY_FLOOR,
   FREE_TIER_FOLLOW_LIMIT,
   MAX_MERGE_INPUT,
+  SHARD_COUNT,
 } from "../constants";
 import { _ISO2_REGISTRY_FOR_TESTS, isValidIso2 } from "../lib/iso2";
+import { userIdToShard } from "../lib/shards";
 import { ISO2_TO_ISO3 } from "../../src/utils/country-codes";
 
 const modules = import.meta.glob("../**/*.ts");
+
+/**
+ * Build a `convexTest` instance AND pre-seed the
+ * `followedCountriesShards` lock table — every `followCountry` /
+ * `unfollowCountry` / `mergeAnonymousLocal` mutation throws
+ * SHARDS_NOT_SEEDED without it (Codex round-4 P0 v2). All test fixtures
+ * use this helper instead of calling `convexTest(schema, modules)`
+ * directly so the seed pre-condition is uniform.
+ */
+async function makeT(): Promise<ReturnType<typeof convexTest>> {
+  const t = convexTest(schema, modules);
+  await t.mutation(internal.followedCountries._seedShards, {});
+  return t;
+}
 
 const USER_A = {
   subject: "user-tests-fc-A",
@@ -201,7 +217,7 @@ describe("iso2 registry — sanity & boundary cases", () => {
 
 describe("followCountry — happy path & idempotency", () => {
   test("PRO user follows 'US' → row inserted, counter US=1, idempotent:false", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -214,7 +230,7 @@ describe("followCountry — happy path & idempotency", () => {
   });
 
   test("PRO user calls followCountry('US') twice → second is idempotent, one row, counter still 1", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -232,7 +248,7 @@ describe("followCountry — happy path & idempotency", () => {
 
 describe("followCountry — free-tier cap", () => {
   test("free user with 2 rows → followCountry('US') succeeds; currentCount becomes 3", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // No seedProEntitlement — user is free.
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
@@ -249,7 +265,7 @@ describe("followCountry — free-tier cap", () => {
   });
 
   test("free user with 3 rows → followCountry('FR') throws FREE_CAP with currentCount=3, limit=3", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
       country: "GB",
@@ -276,7 +292,7 @@ describe("followCountry — free-tier cap", () => {
   });
 
   test("expired entitlement is treated as free-tier", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Expired entitlement = free.
     await seedProEntitlement(t, USER_A.subject, Date.now() - 1000);
     const asUser = t.withIdentity(USER_A);
@@ -299,7 +315,7 @@ describe("followCountry — free-tier cap", () => {
 
 describe("followCountry — tier-first skip-collect optimization (P3 #21)", () => {
   test("PRO user with many existing rows is never blocked by FREE_CAP — collect() not called for cap check", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     // Hand-seed 10 rows (> FREE_TIER_FOLLOW_LIMIT) to prove the PRO path
@@ -324,14 +340,14 @@ describe("followCountry — tier-first skip-collect optimization (P3 #21)", () =
 
 describe("followCountry — auth & input validation", () => {
   test("unauthenticated → UNAUTHENTICATED", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.mutation(api.followedCountries.followCountry, { country: "US" }),
     ).rejects.toThrow(/UNAUTHENTICATED/);
   });
 
   test("invalid ISO-2 inputs all throw INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     for (const bad of ["us", "USA", "XX", "EN", "UK", "", " "]) {
@@ -350,7 +366,7 @@ describe("followCountry — auth & input validation", () => {
 
 describe("unfollowCountry — happy path & idempotency", () => {
   test("existing row → deleted, counter -1, idempotent:false", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
@@ -368,7 +384,7 @@ describe("unfollowCountry — happy path & idempotency", () => {
   });
 
   test("absent row → idempotent:true, counter NOT touched", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -382,7 +398,7 @@ describe("unfollowCountry — happy path & idempotency", () => {
   });
 
   test("second unfollow on already-deleted row → idempotent:true", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
@@ -400,14 +416,14 @@ describe("unfollowCountry — happy path & idempotency", () => {
   });
 
   test("unauthenticated → UNAUTHENTICATED", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.mutation(api.followedCountries.unfollowCountry, { country: "US" }),
     ).rejects.toThrow(/UNAUTHENTICATED/);
   });
 
   test("invalid ISO-2 → INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     await expect(
@@ -424,7 +440,7 @@ describe("unfollowCountry — happy path & idempotency", () => {
 
 describe("counter maintenance — multi-user", () => {
   test("two different users following 'US' → counter 0→1→2; unfollows → 2→1→0", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     await seedProEntitlement(t, USER_B.subject);
     const asA = t.withIdentity(USER_A);
@@ -451,7 +467,7 @@ describe("counter maintenance — multi-user", () => {
   });
 
   test("counter never goes below 0 (defensive max-with-zero)", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Hand-seed a 0-count counter row to simulate drift.
     await t.run(async (ctx) => {
       await ctx.db.insert("followedCountriesCounts", {
@@ -480,7 +496,7 @@ describe("counter maintenance — multi-user", () => {
 
 describe("counter maintenance — idempotency does NOT double-count", () => {
   test("follow same country twice → counter +1, not +2", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -494,7 +510,7 @@ describe("counter maintenance — idempotency does NOT double-count", () => {
   });
 
   test("unfollow absent row → counter NOT decremented", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // User-A follows US; user-B then unfollows US (which they never followed).
     // User-B's unfollow should be idempotent and NOT touch the counter.
     await seedProEntitlement(t, USER_A.subject);
@@ -519,7 +535,7 @@ describe("counter maintenance — idempotency does NOT double-count", () => {
 
 describe("mergeAnonymousLocal — PRO happy path", () => {
   test("PRO user has ['US'], input ['GB','JP'] → final ['US','GB','JP']", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -547,7 +563,7 @@ describe("mergeAnonymousLocal — PRO happy path", () => {
   });
 
   test("PRO user with no rows, input ['US','US','US'] → canonicalize to ['US']; one row; counter +1", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -568,7 +584,7 @@ describe("mergeAnonymousLocal — PRO happy path", () => {
 
 describe("mergeAnonymousLocal — free-tier cap", () => {
   test("free user with ['US'] (1), input ['GB','JP','CN'] → accept first 2; CN to droppedDueToCap", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
       country: "US",
@@ -594,7 +610,7 @@ describe("mergeAnonymousLocal — free-tier cap", () => {
   });
 
   test("free user already at cap → accepted=[], all to droppedDueToCap", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
       country: "US",
@@ -626,7 +642,7 @@ describe("mergeAnonymousLocal — free-tier cap", () => {
   });
 
   test("abuse — free user posts 50-element array → cap fits only (3 - existing); final NEVER exceeds 3", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const asUser = t.withIdentity(USER_A);
     // Existing = 0; cap = 3 should fit.
     const big = Array.from({ length: 50 }, (_, i) => {
@@ -704,7 +720,7 @@ describe("mergeAnonymousLocal — free-tier cap", () => {
 
 describe("mergeAnonymousLocal — input validation", () => {
   test("oversized input (200 elements) → INPUT_TOO_LARGE", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -720,7 +736,7 @@ describe("mergeAnonymousLocal — input validation", () => {
   });
 
   test("empty input → EMPTY_INPUT", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     await expect(
@@ -731,7 +747,7 @@ describe("mergeAnonymousLocal — input validation", () => {
   });
 
   test("unauthenticated → UNAUTHENTICATED", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.mutation(api.followedCountries.mergeAnonymousLocal, {
         countries: ["US"],
@@ -740,7 +756,7 @@ describe("mergeAnonymousLocal — input validation", () => {
   });
 
   test("input ['US','xx','United States'] → accepted=['US'], droppedInvalid=['xx','United States']", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -757,7 +773,7 @@ describe("mergeAnonymousLocal — input validation", () => {
   });
 
   test("mixed valid/invalid + duplicates: ['US','us','US','XX','GB'] → drops 'us'+'XX'; canonicalizes valid to ['US','GB']", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -774,7 +790,7 @@ describe("mergeAnonymousLocal — input validation", () => {
 
 describe("mergeAnonymousLocal — duplicate inputs free-tier near-cap", () => {
   test("free user with no rows, input ['US','US','GB','GB','JP','CN'] → cap accepts first 3 unique; CN to droppedDueToCap", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const asUser = t.withIdentity(USER_A);
 
     const result = await asUser.mutation(
@@ -845,7 +861,7 @@ describe("constants — sanity", () => {
 
 describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   test("concurrent same-user same-country: Promise.all of 2 followCountry('US') → exactly 1 row, counter=1, meta=1, second is idempotent", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -866,7 +882,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("concurrent same-user cap-boundary: free user with 2 rows + Promise.all(follow('GB'), follow('JP')) → at most 3 rows, cap holds", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Free user (no PRO). Seed 2 of 3 cap slots.
     await seedFollowedCountries(t, USER_A.subject, ["US", "DE"]);
     const asUser = t.withIdentity(USER_A);
@@ -899,7 +915,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("concurrent same-user mixed follow/unfollow on US: final state is consistent (count matches row count, no orphans)", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     // Seed US so unfollow has something to remove.
     await seedFollowedCountries(t, USER_A.subject, ["US"]);
@@ -932,7 +948,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("concurrent mergeAnonymousLocal from N tabs (free user, 5-element list) → final ≤ FREE_TIER_FOLLOW_LIMIT, no duplicate (userId, country) rows", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // No PRO seed → free user, cap=3.
     const asUser = t.withIdentity(USER_A);
     const codes = ["US", "GB", "JP", "CN", "FR"];
@@ -962,7 +978,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("concurrent mergeAnonymousLocal from N tabs (PRO user, 5-element list) → exactly the deduped union, no duplicates", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     const codes = ["US", "GB", "JP", "CN", "FR"];
@@ -988,7 +1004,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("user-meta count parity invariant after a sequence of mutations", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -1010,7 +1026,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("idempotent followCountry does NOT bump user-meta count", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -1022,7 +1038,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("idempotent unfollowCountry does NOT decrement user-meta count", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -1041,7 +1057,7 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
   });
 
   test("FREE_CAP throw rolls back all writes — meta is unchanged", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Free user at cap.
     await seedFollowedCountries(t, USER_A.subject, ["US", "GB", "JP"]);
     expect(await readUserMetaCount(t, USER_A.subject)).toBe(3);
@@ -1055,5 +1071,186 @@ describe("per-user serialization — cap-bypass mitigation (P0)", () => {
     expect(await readUserMetaCount(t, USER_A.subject)).toBe(3);
     expect((await readUserFollows(t, USER_A.subject)).length).toBe(3);
     expect(await readCounter(t, "FR")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sharded-lock pre-seed (Codex round-4 P0 v2)
+//
+// The previous P0 fix added `followedCountriesUserMeta` keyed by userId
+// as a per-user lock — but that document is created LAZILY on first
+// mutation. Convex per-document OCC does NOT protect an empty index
+// range, so two parallel first-ever mutations from the same brand-new
+// user could both read `meta=undefined` and both INSERT, producing
+// duplicate meta rows that break the next `.unique()` read AND re-open
+// the cap-bypass window.
+//
+// The fix is the pre-seeded `followedCountriesShards` table: every
+// mutation reads + patches the shard row at `userIdToShard(userId)`,
+// and that read+write pair on an ALREADY-EXISTING document forces
+// Convex's OCC to serialize the brand-new-user race deterministically.
+// ---------------------------------------------------------------------------
+
+describe("sharded lock — pre-seed & no-meta-dup invariant", () => {
+  test("first-ever follow on a brand-new user creates exactly 1 meta row (no dup)", async () => {
+    const t = await makeT();
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    await asUser.mutation(api.followedCountries.followCountry, {
+      country: "US",
+    });
+
+    // Exactly one meta row for this user — `.unique()` would throw on dup.
+    const metaCount = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("followedCountriesUserMeta")
+        .withIndex("by_user", (q) => q.eq("userId", USER_A.subject))
+        .collect();
+      return rows.length;
+    });
+    expect(metaCount).toBe(1);
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+  });
+
+  test("two back-to-back mergeAnonymousLocal calls on a brand-new user → one meta row, correct count, no duplicate followedCountries rows", async () => {
+    // The original cap-bypass scenario, but now with the shard-tier fix:
+    // the second call sees the post-winner state and either accepts fewer
+    // rows OR is fully idempotent. Final state must satisfy the
+    // meta-uniqueness invariant.
+    const t = await makeT();
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    const codes = ["US", "GB", "JP"];
+
+    // Two PARALLEL calls (convex-test serializes, but the post-winner
+    // state of the first MUST be visible to the second under the shard
+    // lock — and the meta-row uniqueness must hold either way).
+    const results = await Promise.allSettled([
+      asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+        countries: codes,
+      }),
+      asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+        countries: codes,
+      }),
+    ]);
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+    // Exactly one meta row for this user — the brand-new-user TOCTOU
+    // is closed by the shard lock.
+    const metaRows = await t.run(async (ctx) => {
+      return await ctx.db
+        .query("followedCountriesUserMeta")
+        .withIndex("by_user", (q) => q.eq("userId", USER_A.subject))
+        .collect();
+    });
+    expect(metaRows.length).toBe(1);
+    expect(metaRows[0].count).toBe(codes.length);
+
+    // No duplicate (userId, country) rows.
+    const rows = await readUserFollows(t, USER_A.subject);
+    expect(new Set(rows).size).toBe(rows.length);
+    expect(new Set(rows)).toEqual(new Set(codes));
+    expect(rows.length).toBe(codes.length);
+  });
+
+  test("operator running _seedShards after a partial seed completes idempotently", async () => {
+    // makeT() already calls _seedShards (so all SHARD_COUNT rows exist).
+    // Re-running it should be a no-op: 0 new rows, total still SHARD_COUNT.
+    const t = await makeT();
+
+    const second = await t.mutation(
+      internal.followedCountries._seedShards,
+      {},
+    );
+    expect(second).toEqual({ seeded: 0 });
+
+    // Manually delete a few shards to simulate partial-seed state, then
+    // re-run: the mutation should plug only the holes and report exactly
+    // the count it inserted.
+    await t.run(async (ctx) => {
+      const some = await ctx.db
+        .query("followedCountriesShards")
+        .withIndex("by_shard", (q) => q.eq("shardId", 0))
+        .unique();
+      if (some) await ctx.db.delete(some._id);
+      const some2 = await ctx.db
+        .query("followedCountriesShards")
+        .withIndex("by_shard", (q) => q.eq("shardId", 5))
+        .unique();
+      if (some2) await ctx.db.delete(some2._id);
+    });
+    const third = await t.mutation(
+      internal.followedCountries._seedShards,
+      {},
+    );
+    expect(third).toEqual({ seeded: 2 });
+
+    // Total row count is exactly SHARD_COUNT.
+    const total = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("followedCountriesShards")
+        .collect();
+      return rows.length;
+    });
+    expect(total).toBe(SHARD_COUNT);
+  });
+
+  test("SHARDS_NOT_SEEDED throw when the shards table is empty (operator error)", async () => {
+    // BYPASS makeT() so the shards table is NOT seeded — this is the
+    // operator-error scenario where deploy missed the seed step and the
+    // daily cron hasn't fired yet.
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    await expect(
+      asUser.mutation(api.followedCountries.followCountry, {
+        country: "US",
+      }),
+    ).rejects.toThrow(/SHARDS_NOT_SEEDED/);
+
+    await expect(
+      asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+        countries: ["US"],
+      }),
+    ).rejects.toThrow(/SHARDS_NOT_SEEDED/);
+
+    await expect(
+      asUser.mutation(api.followedCountries.unfollowCountry, {
+        country: "US",
+      }),
+    ).rejects.toThrow(/SHARDS_NOT_SEEDED/);
+  });
+
+  test("public seedShards mutation (operator CLI surface) is idempotent", async () => {
+    const t = await makeT();
+    // Public seedShards must be reachable from `t.mutation` (operator runs
+    // it via `npx convex run followedCountries:seedShards`).
+    const r = await t.mutation(api.followedCountries.seedShards, {});
+    expect(r).toEqual({ seeded: 0 });
+
+    // Total still SHARD_COUNT.
+    const total = await t.run(async (ctx) => {
+      const rows = await ctx.db
+        .query("followedCountriesShards")
+        .collect();
+      return rows.length;
+    });
+    expect(total).toBe(SHARD_COUNT);
+  });
+
+  test("userIdToShard is deterministic and within [0, SHARD_COUNT)", () => {
+    // Sanity: the hash function MUST be deterministic. If two calls for
+    // the same userId returned different shards, the OCC serialization
+    // would silently break under load.
+    for (const id of ["user-a", "user-with-very-long-clerk-subject-id-12345"]) {
+      const a = userIdToShard(id);
+      const b = userIdToShard(id);
+      expect(a).toBe(b);
+      expect(a).toBeGreaterThanOrEqual(0);
+      expect(a).toBeLessThan(SHARD_COUNT);
+    }
   });
 });

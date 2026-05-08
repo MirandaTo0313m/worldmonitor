@@ -54,3 +54,21 @@ export const MAX_MERGE_INPUT = 100;
 // below this threshold are returned as `0` to public callers so a single
 // follower can't be deanonymized via the count endpoint.
 export const COUNTRY_COUNT_PRIVACY_FLOOR = 5;
+
+// Number of pre-seeded lock shards in `followedCountriesShards`. Every
+// `followCountry` / `unfollowCountry` / `mergeAnonymousLocal` mutation
+// reads + patches the shard row at `userIdToShard(userId)` so Convex's
+// per-document OCC serializes concurrent same-user mutations against an
+// always-existing row. Without a pre-seeded shard table, the lazy-create
+// path on `followedCountriesUserMeta` had a nested TOCTOU: two parallel
+// first-ever mutations from the same brand-new user could both read
+// `meta=undefined` and both INSERT, producing duplicate meta rows that
+// break the `.unique()` read and re-open the cap-bypass window
+// (Codex round-4 P0 v2).
+//
+// SHARD_COUNT is fixed at deploy time — changing it would require
+// re-seeding ALL shard rows AND draining all in-flight mutations. Set
+// once and treat as immutable. 64 is enough headroom that two random
+// users colliding on the same shard is rare; collisions are correctness-
+// preserving (just an extra serialization point), not a bug.
+export const SHARD_COUNT = 64;

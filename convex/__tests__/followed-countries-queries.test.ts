@@ -6,6 +6,18 @@ import { COUNTRY_COUNT_PRIVACY_FLOOR } from "../constants";
 
 const modules = import.meta.glob("../**/*.ts");
 
+/**
+ * Build a `convexTest` instance AND pre-seed `followedCountriesShards`
+ * (Codex round-4 P0 v2). Same helper shape as
+ * `followed-countries-mutations.test.ts`. Required for any test that
+ * invokes `followCountry` / `unfollowCountry` / `mergeAnonymousLocal`.
+ */
+async function makeT(): Promise<ReturnType<typeof convexTest>> {
+  const t = convexTest(schema, modules);
+  await t.mutation(internal.followedCountries._seedShards, {});
+  return t;
+}
+
 const USER_A = {
   subject: "user-tests-fcq-A",
   tokenIdentifier: "clerk|user-tests-fcq-A",
@@ -80,7 +92,7 @@ async function seedFollowers(
 
 describe("listFollowed", () => {
   test("PRO user with ['US','GB'] (added in this order) → returns ['US','GB'] sorted by addedAt asc", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -112,7 +124,7 @@ describe("listFollowed", () => {
   });
 
   test("user with 0 rows → []", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     const result = await asUser.query(api.followedCountries.listFollowed, {});
@@ -120,13 +132,13 @@ describe("listFollowed", () => {
   });
 
   test("unauthenticated → []", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const result = await t.query(api.followedCountries.listFollowed, {});
     expect(result).toEqual([]);
   });
 
   test("reactivity smoke: add a row, query again sees the new row", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
 
@@ -142,7 +154,7 @@ describe("listFollowed", () => {
   });
 
   test("does NOT expose addedAt or userId — return is string[]", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedProEntitlement(t, USER_A.subject);
     const asUser = t.withIdentity(USER_A);
     await asUser.mutation(api.followedCountries.followCountry, {
@@ -163,7 +175,7 @@ describe("listFollowed", () => {
 
 describe("countFollowers", () => {
   test("7 followers (above privacy floor 5) → returns 7", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedFollowers(t, "US", 7);
 
     const result = await t.query(api.followedCountries.countFollowers, {
@@ -173,7 +185,7 @@ describe("countFollowers", () => {
   });
 
   test("3 followers (below privacy floor 5) → returns 0", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedFollowers(t, "US", 3);
 
     const result = await t.query(api.followedCountries.countFollowers, {
@@ -183,7 +195,7 @@ describe("countFollowers", () => {
   });
 
   test("exactly 5 followers (at privacy floor) → returns 5", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedFollowers(t, "US", 5);
 
     const result = await t.query(api.followedCountries.countFollowers, {
@@ -195,7 +207,7 @@ describe("countFollowers", () => {
   });
 
   test("exactly 4 followers (below privacy floor) → returns 0", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedFollowers(t, "US", 4);
 
     const result = await t.query(api.followedCountries.countFollowers, {
@@ -205,7 +217,7 @@ describe("countFollowers", () => {
   });
 
   test("counter row absent → 0 (not an error)", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // No seedFollowers — counter row simply doesn't exist.
     const result = await t.query(api.followedCountries.countFollowers, {
       country: "US",
@@ -214,21 +226,21 @@ describe("countFollowers", () => {
   });
 
   test("invalid country 'INVALID' → INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.query(api.followedCountries.countFollowers, { country: "INVALID" }),
     ).rejects.toThrow(/INVALID_COUNTRY/);
   });
 
   test("lowercase 'us' → INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.query(api.followedCountries.countFollowers, { country: "us" }),
     ).rejects.toThrow(/INVALID_COUNTRY/);
   });
 
   test("regex-passing-but-not-in-registry 'XX' → INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.query(api.followedCountries.countFollowers, { country: "XX" }),
     ).rejects.toThrow(/INVALID_COUNTRY/);
@@ -241,7 +253,7 @@ describe("countFollowers", () => {
 
 describe("listFollowersPage (internal)", () => {
   test("country with 7 followers, limit=5 → first page 5 ids + nextCursor; second page 2 ids + nextCursor:null", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const seededIds = await seedFollowers(t, "US", 7);
 
     const page1 = await t.query(
@@ -268,7 +280,7 @@ describe("listFollowersPage (internal)", () => {
   });
 
   test("country with 0 followers → {userIds:[], nextCursor:null}", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const result = await t.query(
       internal.followedCountries.listFollowersPage,
       { country: "US", cursor: null, limit: 50 },
@@ -278,7 +290,7 @@ describe("listFollowersPage (internal)", () => {
   });
 
   test("limit clamp: limit=10000 effectively clamps to 500", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Seed 600 followers to verify that limit=10000 returns at most 500.
     await seedFollowers(t, "US", 600);
 
@@ -294,7 +306,7 @@ describe("listFollowersPage (internal)", () => {
   });
 
   test("limit clamp: limit=0 clamps to 1 (returns at most 1 row)", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await seedFollowers(t, "US", 5);
 
     const result = await t.query(
@@ -307,7 +319,7 @@ describe("listFollowersPage (internal)", () => {
   });
 
   test("invalid country 'XX' → INVALID_COUNTRY", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await expect(
       t.query(internal.followedCountries.listFollowersPage, {
         country: "XX",
@@ -353,7 +365,7 @@ describe("listFollowersPage (internal)", () => {
 
 describe("internalListFollowedForUser", () => {
   test("returns the user's followed countries sorted by addedAt asc", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     // Hand-seed two rows for USER_A with explicit addedAt.
     await t.run(async (ctx) => {
       await ctx.db.insert("followedCountries", {
@@ -377,7 +389,7 @@ describe("internalListFollowedForUser", () => {
   });
 
   test("user with no rows → []", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     const result = await t.query(
       internal.followedCountries.internalListFollowedForUser,
       { userId: USER_B.subject },
@@ -386,7 +398,7 @@ describe("internalListFollowedForUser", () => {
   });
 
   test("scopes correctly to userId — does NOT leak other users' rows", async () => {
-    const t = convexTest(schema, modules);
+    const t = await makeT();
     await t.run(async (ctx) => {
       await ctx.db.insert("followedCountries", {
         userId: USER_A.subject,

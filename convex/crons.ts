@@ -35,4 +35,17 @@ crons.daily(
   {},
 );
 
+// Idempotent daily seed of the `followedCountriesShards` lock table
+// (Codex round-4 P0 v2). Skips existing shards; inserts any missing
+// shard ids in `[0, SHARD_COUNT)`. Defends against a deploy-time seed
+// step being skipped — every `followCountry` / `unfollowCountry` /
+// `mergeAnonymousLocal` mutation throws SHARDS_NOT_SEEDED if its shard
+// row is missing, so the cron is the steady-state self-heal. Cheap:
+// post-seed it just runs a 64-row collect + skip-loop.
+crons.daily(
+  "followed-countries-shards-seed",
+  { hourUTC: 3, minuteUTC: 0 },
+  internal.followedCountries._seedShards,
+);
+
 export default crons;

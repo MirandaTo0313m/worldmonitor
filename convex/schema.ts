@@ -164,11 +164,41 @@ export default defineSchema({
   // for `userId`. The mutations are the only writers; tests assert this
   // parity after every operation. See plan U13 / Codex round-3 P0
   // (run 20260502-195816-dae403d7).
+  //
+  // KEY CAVEAT (Codex round-4 P0 v2): this row is created LAZILY on the
+  // first mutation, so its OCC alone does NOT close a brand-new user's
+  // race — two parallel first-ever mutations would both read empty and
+  // both insert, producing duplicate meta rows. The fix is the pre-seeded
+  // `followedCountriesShards` table below: every mutation reads + patches
+  // the shard row at `userIdToShard(userId)` BEFORE this lazy-create can
+  // happen, and Convex's OCC on the shard row serializes the two parallel
+  // mutations so the second one observes the first's user-meta insert.
   followedCountriesUserMeta: defineTable({
     userId: v.string(),
     count: v.number(),
     updatedAt: v.number(),
   }).index("by_user", ["userId"]),
+
+  // Pre-seeded sharded lock table for the followed-countries watchlist
+  // (Codex round-4 P0 v2). One row per shard id `0..SHARD_COUNT-1`.
+  // Mapped to via `convex/lib/shards.ts::userIdToShard(userId)`, a
+  // deterministic non-cryptographic hash. Every mutation that touches
+  // `followedCountries` for a user reads the shard row at the top of the
+  // handler AND patches `lastTouchedAt` at the end — that read+write pair
+  // is what triggers Convex's per-document OCC to serialize concurrent
+  // same-user mutations. Because rows are pre-seeded (never lazily
+  // created), there is no TOCTOU window: the loser of an OCC race retries
+  // against the post-winner state, sees the user-meta row the winner
+  // inserted, and proceeds correctly.
+  //
+  // SHARD_COUNT is fixed at deploy time. Re-seeding requires draining
+  // in-flight mutations; do not change without an operator runbook.
+  // Seeding is idempotent — `_seedShards` skips existing rows. A daily
+  // cron + manual operator mutation guarantee the table stays seeded.
+  followedCountriesShards: defineTable({
+    shardId: v.number(),
+    lastTouchedAt: v.number(),
+  }).index("by_shard", ["shardId"]),
 
   telegramPairingTokens: defineTable({
     userId: v.string(),

@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import type { Doc } from "./_generated/dataModel";
 import {
+  internalMutation,
   internalQuery,
   type MutationCtx,
   mutation,
@@ -10,8 +11,10 @@ import {
   COUNTRY_COUNT_PRIVACY_FLOOR,
   FREE_TIER_FOLLOW_LIMIT,
   MAX_MERGE_INPUT,
+  SHARD_COUNT,
 } from "./constants";
 import { isValidIso2 } from "./lib/iso2";
+import { userIdToShard } from "./lib/shards";
 
 /**
  * Layer-2 entitlement gate for the followed-countries watchlist primitive
@@ -43,11 +46,67 @@ async function readEntitlementTier(
 }
 
 /**
+ * Read the pre-seeded shard row for `userId` and throw a loud
+ * SHARDS_NOT_SEEDED error if it doesn't exist (operator error — the
+ * `_seedShards` mutation must have run as part of deploy + the daily
+ * cron keeps it seeded). Returns the shard `_id` so the caller can patch
+ * it at the end of the mutation. The read+write pair on the shard row is
+ * what triggers Convex's per-document OCC to serialize concurrent
+ * same-user mutations against an ALREADY-EXISTING document — closing the
+ * nested TOCTOU on the lazy-created `followedCountriesUserMeta` row.
+ *
+ * See `convex/lib/shards.ts::userIdToShard` for the hash and
+ * `convex/constants.ts::SHARD_COUNT` for the fixed shard count.
+ */
+async function readShardOrThrow(
+  ctx: MutationCtx,
+  userId: string,
+): Promise<Doc<"followedCountriesShards">> {
+  const shardId = userIdToShard(userId);
+  const shard = await ctx.db
+    .query("followedCountriesShards")
+    .withIndex("by_shard", (q) => q.eq("shardId", shardId))
+    .unique();
+  if (!shard) {
+    // Operator error — should never happen in production after deploy +
+    // the daily `_seedShards` cron. Logged loudly so on-call sees it.
+    console.error(
+      JSON.stringify({
+        breadcrumb: "followed_countries_shards_not_seeded",
+        shardId,
+        shardCount: SHARD_COUNT,
+      }),
+    );
+    throw new ConvexError({ kind: "SHARDS_NOT_SEEDED", shardId });
+  }
+  return shard;
+}
+
+/**
+ * Patch the shard row's `lastTouchedAt` — the OCC-serializing write that
+ * pairs with `readShardOrThrow`. MUST run on the success path AFTER all
+ * other writes; on any throw, Convex aborts the entire transaction and
+ * the patch is rolled back along with everything else.
+ */
+async function touchShard(
+  ctx: MutationCtx,
+  shard: Doc<"followedCountriesShards">,
+): Promise<void> {
+  await ctx.db.patch(shard._id, { lastTouchedAt: Date.now() });
+}
+
+/**
  * Read the per-user serialization row for `userId`. Returns the row (if
  * exists) and the denormalized count (0 if no row). Every mutation that
  * mutates `followedCountries` for the user MUST call this AND patch/insert
  * the row at the end — that read+write pair is what triggers Convex
  * per-document OCC retry under same-user concurrency.
+ *
+ * NOTE: this row is created LAZILY on first use, so its OCC ALONE does
+ * NOT serialize the brand-new-user race (two parallel first-ever
+ * mutations both read empty and both INSERT, producing duplicate rows
+ * that break the `.unique()` read). The pre-seeded shard row above
+ * closes that window — it always exists, so its OCC is bulletproof.
  */
 async function readUserMeta(
   ctx: MutationCtx,
@@ -180,17 +239,23 @@ export type MergeAnonymousLocalResult = {
  * 5. Atomic counter +1 in the same transaction as the row insert.
  * 6. Atomic per-user-meta count patch — THIS is the OCC-serializing write.
  *
- * Per-user serialization (cap-bypass mitigation, Codex round-3 P0):
- *   Two parallel `followCountry` calls from the SAME user can otherwise
- *   both read empty/under-cap and both insert. Convex per-document OCC
- *   tracks reads at the document level, NOT at the index-range level, so
- *   reads of `followedCountries` by-index do not conflict. We instead
- *   read+write a single per-user document `followedCountriesUserMeta`,
- *   which Convex's OCC DOES serialize: the loser of the race retries,
- *   re-reads the new state (winner's row is now visible), and either
- *   passes correctly, throws FREE_CAP, or returns idempotent. The
- *   denormalized `count` also makes the cap check O(1) (was O(n) under
- *   `.collect()`).
+ * Two-tier per-user serialization (cap-bypass mitigation):
+ *   Tier 1 — pre-seeded shard row (Codex round-4 P0 v2): EVERY mutation
+ *   reads + patches `followedCountriesShards[userIdToShard(userId)]` at
+ *   the boundaries of the handler. Because the row is pre-seeded, its
+ *   OCC is bulletproof — the loser of two parallel first-ever mutations
+ *   retries against the post-winner state and observes the winner's
+ *   user-meta insert.
+ *
+ *   Tier 2 — denormalized user-meta count (Codex round-3 P0): under the
+ *   shard lock, we safely lazy-create the per-user `followedCountriesUserMeta`
+ *   row (kept additionally for the O(1) cap-check denominator and as the
+ *   parity invariant `count === COUNT(followedCountries WHERE userId=X)`).
+ *
+ * Without Tier 1, two parallel first-ever mutations could both read
+ * `meta=undefined`, both INSERT, and produce duplicate meta rows that
+ * break the `.unique()` read AND re-open the cap-bypass window. With
+ * Tier 1 in place, the brand-new-user race is closed deterministically.
  *
  * Errors are typed `ConvexError({kind, ...})` with object data so callers
  * can branch on `err.data.kind` (memory:
@@ -210,9 +275,11 @@ export const followCountry = mutation({
       });
     }
 
-    // OCC-serialization read. Tracked by Convex's per-document conflict
-    // detector — concurrent same-user mutations that both read this row
-    // and both try to patch it will conflict on commit.
+    // Tier-1 lock: pre-seeded shard row. Read at top, patch at end.
+    const shard = await readShardOrThrow(ctx, userId);
+
+    // Tier-2 read: per-user denormalized count (lazy-created, but safe
+    // under the shard lock above).
     const { meta, count: currentCount } = await readUserMeta(ctx, userId);
 
     const existingRow = await ctx.db
@@ -243,8 +310,10 @@ export const followCountry = mutation({
       addedAt: Date.now(),
     });
     await incrementCountryCounter(ctx, args.country);
-    // OCC-serialization write — patch the same row we read above.
+    // Tier-2 OCC write — patch the user-meta row.
     await writeUserMeta(ctx, userId, meta, currentCount + 1);
+    // Tier-1 OCC write — patch the pre-seeded shard row.
+    await touchShard(ctx, shard);
 
     return { ok: true, idempotent: false };
   },
@@ -274,9 +343,12 @@ export const unfollowCountry = mutation({
       });
     }
 
-    // OCC-serialization read — see followCountry for full rationale. The
-    // idempotent (no-row) path skips the user-meta write on purpose: it
-    // makes no observable change, so it has no race to lose.
+    // Tier-1 lock: pre-seeded shard row. Read at top, patch at end on
+    // the non-idempotent path. The idempotent (no-row) branch returns
+    // before any write, so there's no race to lose.
+    const shard = await readShardOrThrow(ctx, userId);
+
+    // Tier-2 read — see followCountry for full rationale.
     const { meta, count: currentCount } = await readUserMeta(ctx, userId);
 
     const existingRow = await ctx.db
@@ -291,10 +363,12 @@ export const unfollowCountry = mutation({
 
     await ctx.db.delete(existingRow._id);
     await decrementCountryCounter(ctx, args.country);
-    // OCC-serialization write — clamp at zero defensively in case a
-    // hand-seeded test or migration left meta out of parity. The mutations
-    // are the only writers in production; this clamp protects tests.
+    // Tier-2 OCC write — clamp at zero defensively in case a hand-seeded
+    // test or migration left meta out of parity. The mutations are the
+    // only writers in production; this clamp protects tests.
     await writeUserMeta(ctx, userId, meta, Math.max(0, currentCount - 1));
+    // Tier-1 OCC write.
+    await touchShard(ctx, shard);
 
     return { ok: true, idempotent: false };
   },
@@ -371,12 +445,13 @@ export const mergeAnonymousLocal = mutation({
       }
     }
 
-    // OCC-serialization read. Two parallel `mergeAnonymousLocal` calls
-    // from the same user (e.g. the user has the page open in two tabs and
-    // signs in in both) would otherwise both pass the cap check on the
-    // same denominator and both insert. Reading + writing this row forces
-    // Convex to serialize them: the loser retries, sees the winner's
-    // increment, and either accepts fewer rows OR returns identical-state.
+    // Tier-1 lock: pre-seeded shard row. Read at top, patch at end if
+    // any row was actually accepted (no patch on the all-no-op branch
+    // since there's no observable change to race on).
+    const shard = await readShardOrThrow(ctx, userId);
+
+    // Tier-2 read. Under the shard lock above, the brand-new-user lazy
+    // create on `followedCountriesUserMeta` is now race-free.
     const { meta, count: existingCount } = await readUserMeta(ctx, userId);
 
     // Step 6: read existing rows; build existingSet. Still required for
@@ -417,10 +492,14 @@ export const mergeAnonymousLocal = mutation({
       await incrementCountryCounter(ctx, country);
     }
 
-    // OCC-serialization write — same rule as followCountry. Skip when
+    // Tier-2 OCC write — same rule as followCountry. Skip when
     // accepted=[] (no change to count → no write to race on).
     if (accepted.length > 0) {
       await writeUserMeta(ctx, userId, meta, existingCount + accepted.length);
+      // Tier-1 OCC write — only on the path that produced observable
+      // changes. The all-no-op branch leaves both shard and user-meta
+      // untouched.
+      await touchShard(ctx, shard);
     }
 
     // Step 12: structured warning when free users overflow cap. No
@@ -596,5 +675,81 @@ export const internalListFollowedForUser = internalQuery({
     return rows
       .sort((a, b) => a.addedAt - b.addedAt)
       .map((r) => r.country);
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Sharded-lock seed (Codex round-4 P0 v2)
+// ---------------------------------------------------------------------------
+
+/**
+ * `_seedShards()` — INTERNAL-ONLY, idempotent pre-seeder for the
+ * `followedCountriesShards` table. Inserts rows for every shard id in
+ * `[0, SHARD_COUNT)` that doesn't already exist; existing rows are left
+ * alone (the `lastTouchedAt` value is opaque — it's only used as the
+ * OCC-tracking field, never read for application logic).
+ *
+ * Wired into:
+ *   - `convex/crons.ts` daily cron (idempotent, cheap — defends against
+ *     a deploy-time seed step being skipped).
+ *   - `seedShards` public mutation below — admin-runnable to force-seed
+ *     after a fresh deploy without waiting for the cron tick.
+ *
+ * Returns `{ seeded: N }` — the number of NEW rows inserted. After
+ * steady-state, every call returns `{ seeded: 0 }` and the table has
+ * exactly SHARD_COUNT rows.
+ */
+export const _seedShards = internalMutation({
+  args: {},
+  handler: async (ctx): Promise<{ seeded: number }> => {
+    const existing = await ctx.db
+      .query("followedCountriesShards")
+      .collect();
+    const have = new Set<number>(existing.map((r) => r.shardId));
+    const now = Date.now();
+    let seeded = 0;
+    for (let i = 0; i < SHARD_COUNT; i++) {
+      if (!have.has(i)) {
+        await ctx.db.insert("followedCountriesShards", {
+          shardId: i,
+          lastTouchedAt: now,
+        });
+        seeded += 1;
+      }
+    }
+    return { seeded };
+  },
+});
+
+/**
+ * `seedShards()` — admin-runnable thin wrapper around `_seedShards`.
+ * Operators run `npx convex run --prod followedCountries:seedShards`
+ * after a fresh deploy to seed the shard table immediately, without
+ * waiting for the daily cron. Idempotent — safe to re-run.
+ *
+ * Public so `npx convex run` can target it; the body is identical to the
+ * internal version. We keep both because internalMutation is targetable
+ * by the cron and public mutation is targetable by the operator CLI;
+ * neither alone covers both surfaces cleanly without a wrapper.
+ */
+export const seedShards = mutation({
+  args: {},
+  handler: async (ctx): Promise<{ seeded: number }> => {
+    const existing = await ctx.db
+      .query("followedCountriesShards")
+      .collect();
+    const have = new Set<number>(existing.map((r) => r.shardId));
+    const now = Date.now();
+    let seeded = 0;
+    for (let i = 0; i < SHARD_COUNT; i++) {
+      if (!have.has(i)) {
+        await ctx.db.insert("followedCountriesShards", {
+          shardId: i,
+          lastTouchedAt: now,
+        });
+        seeded += 1;
+      }
+    }
+    return { seeded };
   },
 });
