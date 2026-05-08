@@ -1,4 +1,5 @@
 import { ConvexError, v } from "convex/values";
+import type { Doc } from "./_generated/dataModel";
 import {
   internalQuery,
   type MutationCtx,
@@ -39,6 +40,54 @@ async function readEntitlementTier(
   if (!entitlement) return 0;
   if (entitlement.validUntil < Date.now()) return 0;
   return entitlement.features.tier ?? 0;
+}
+
+/**
+ * Read the per-user serialization row for `userId`. Returns the row (if
+ * exists) and the denormalized count (0 if no row). Every mutation that
+ * mutates `followedCountries` for the user MUST call this AND patch/insert
+ * the row at the end — that read+write pair is what triggers Convex
+ * per-document OCC retry under same-user concurrency.
+ */
+async function readUserMeta(
+  ctx: MutationCtx,
+  userId: string,
+): Promise<{
+  meta: Doc<"followedCountriesUserMeta"> | null;
+  count: number;
+}> {
+  const meta = await ctx.db
+    .query("followedCountriesUserMeta")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .unique();
+  return { meta, count: meta?.count ?? 0 };
+}
+
+/**
+ * Patch (or insert) the per-user serialization row to `newCount`. This is
+ * the OCC-serializing write — concurrent same-user mutations that both
+ * read the same `meta._id` will conflict here, and Convex retries the
+ * loser. The retry re-reads everything (including the row that the winner
+ * inserted), so the second attempt sees the post-winner state and either
+ * passes correctly (still under cap), throws FREE_CAP, or returns
+ * idempotent (winner already inserted the same `(userId, country)`).
+ */
+async function writeUserMeta(
+  ctx: MutationCtx,
+  userId: string,
+  meta: Doc<"followedCountriesUserMeta"> | null,
+  newCount: number,
+): Promise<void> {
+  const now = Date.now();
+  if (meta) {
+    await ctx.db.patch(meta._id, { count: newCount, updatedAt: now });
+  } else {
+    await ctx.db.insert("followedCountriesUserMeta", {
+      userId,
+      count: newCount,
+      updatedAt: now,
+    });
+  }
 }
 
 /**
@@ -124,11 +173,24 @@ export type MergeAnonymousLocalResult = {
  * 2. Validates `country` against the canonical ISO-2 registry; throws
  *    ConvexError({kind:'INVALID_COUNTRY', country}) on miss.
  * 3. Idempotent on (userId, country) — second call returns
- *    {idempotent:true} and does NOT touch the counter.
+ *    {idempotent:true} and does NOT touch the counter or user-meta.
  * 4. Free-tier cap: tier=0 callers with currentCount >= FREE_TIER_FOLLOW_LIMIT
  *    throw ConvexError({kind:'FREE_CAP', currentCount, limit}). PRO callers
  *    are unlimited.
  * 5. Atomic counter +1 in the same transaction as the row insert.
+ * 6. Atomic per-user-meta count patch — THIS is the OCC-serializing write.
+ *
+ * Per-user serialization (cap-bypass mitigation, Codex round-3 P0):
+ *   Two parallel `followCountry` calls from the SAME user can otherwise
+ *   both read empty/under-cap and both insert. Convex per-document OCC
+ *   tracks reads at the document level, NOT at the index-range level, so
+ *   reads of `followedCountries` by-index do not conflict. We instead
+ *   read+write a single per-user document `followedCountriesUserMeta`,
+ *   which Convex's OCC DOES serialize: the loser of the race retries,
+ *   re-reads the new state (winner's row is now visible), and either
+ *   passes correctly, throws FREE_CAP, or returns idempotent. The
+ *   denormalized `count` also makes the cap check O(1) (was O(n) under
+ *   `.collect()`).
  *
  * Errors are typed `ConvexError({kind, ...})` with object data so callers
  * can branch on `err.data.kind` (memory:
@@ -148,6 +210,11 @@ export const followCountry = mutation({
       });
     }
 
+    // OCC-serialization read. Tracked by Convex's per-document conflict
+    // detector — concurrent same-user mutations that both read this row
+    // and both try to patch it will conflict on commit.
+    const { meta, count: currentCount } = await readUserMeta(ctx, userId);
+
     const existingRow = await ctx.db
       .query("followedCountries")
       .withIndex("by_user_country", (q) =>
@@ -158,24 +225,16 @@ export const followCountry = mutation({
       return { ok: true, idempotent: true };
     }
 
-    // P3 #21 — Tier-first skip-collect optimization.
-    // PRO users have no cap, so we can skip the O(N) `.collect()` of all
-    // user rows entirely (the count is only used for the FREE_CAP check).
-    // For free users the count is required to enforce the cap.
+    // P3 #21 — Tier-first cap check using the denormalized count. PRO
+    // users have no cap (returned for free); for free users the
+    // denormalized count is the cap input — no `.collect()` needed.
     const tier = await readEntitlementTier(ctx, userId);
-    if (tier < 1) {
-      const userRows = await ctx.db
-        .query("followedCountries")
-        .withIndex("by_user", (q) => q.eq("userId", userId))
-        .collect();
-      const currentCount = userRows.length;
-      if (currentCount >= FREE_TIER_FOLLOW_LIMIT) {
-        throw new ConvexError({
-          kind: "FREE_CAP",
-          currentCount,
-          limit: FREE_TIER_FOLLOW_LIMIT,
-        });
-      }
+    if (tier < 1 && currentCount >= FREE_TIER_FOLLOW_LIMIT) {
+      throw new ConvexError({
+        kind: "FREE_CAP",
+        currentCount,
+        limit: FREE_TIER_FOLLOW_LIMIT,
+      });
     }
 
     await ctx.db.insert("followedCountries", {
@@ -184,6 +243,8 @@ export const followCountry = mutation({
       addedAt: Date.now(),
     });
     await incrementCountryCounter(ctx, args.country);
+    // OCC-serialization write — patch the same row we read above.
+    await writeUserMeta(ctx, userId, meta, currentCount + 1);
 
     return { ok: true, idempotent: false };
   },
@@ -213,6 +274,11 @@ export const unfollowCountry = mutation({
       });
     }
 
+    // OCC-serialization read — see followCountry for full rationale. The
+    // idempotent (no-row) path skips the user-meta write on purpose: it
+    // makes no observable change, so it has no race to lose.
+    const { meta, count: currentCount } = await readUserMeta(ctx, userId);
+
     const existingRow = await ctx.db
       .query("followedCountries")
       .withIndex("by_user_country", (q) =>
@@ -225,6 +291,10 @@ export const unfollowCountry = mutation({
 
     await ctx.db.delete(existingRow._id);
     await decrementCountryCounter(ctx, args.country);
+    // OCC-serialization write — clamp at zero defensively in case a
+    // hand-seeded test or migration left meta out of parity. The mutations
+    // are the only writers in production; this clamp protects tests.
+    await writeUserMeta(ctx, userId, meta, Math.max(0, currentCount - 1));
 
     return { ok: true, idempotent: false };
   },
@@ -301,18 +371,29 @@ export const mergeAnonymousLocal = mutation({
       }
     }
 
-    // Step 6: read existing rows; build existingSet.
+    // OCC-serialization read. Two parallel `mergeAnonymousLocal` calls
+    // from the same user (e.g. the user has the page open in two tabs and
+    // signs in in both) would otherwise both pass the cap check on the
+    // same denominator and both insert. Reading + writing this row forces
+    // Convex to serialize them: the loser retries, sees the winner's
+    // increment, and either accepts fewer rows OR returns identical-state.
+    const { meta, count: existingCount } = await readUserMeta(ctx, userId);
+
+    // Step 6: read existing rows; build existingSet. Still required for
+    // the dedup against (userId, country) — the meta count is a scalar,
+    // it can't tell us WHICH countries the user already follows.
     const existingRows = await ctx.db
       .query("followedCountries")
       .withIndex("by_user", (q) => q.eq("userId", userId))
       .collect();
     const existingSet = new Set<string>(existingRows.map((r) => r.country));
-    const existingCount = existingRows.length;
 
     // Step 7: filter against existing.
     const newCandidates = canonicalized.filter((c) => !existingSet.has(c));
 
-    // Step 8/9: cap-bounded accept based on entitlement tier.
+    // Step 8/9: cap-bounded accept based on entitlement tier. Uses the
+    // OCC-tracked meta count as the cap denominator — under concurrency,
+    // the loser retries against the post-winner count.
     const tier = await readEntitlementTier(ctx, userId);
     let accepted: string[];
     let droppedDueToCap: string[];
@@ -334,6 +415,12 @@ export const mergeAnonymousLocal = mutation({
         addedAt: now,
       });
       await incrementCountryCounter(ctx, country);
+    }
+
+    // OCC-serialization write — same rule as followCountry. Skip when
+    // accepted=[] (no change to count → no write to race on).
+    if (accepted.length > 0) {
+      await writeUserMeta(ctx, userId, meta, existingCount + accepted.length);
     }
 
     // Step 12: structured warning when free users overflow cap. No

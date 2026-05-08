@@ -151,6 +151,25 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_country", ["country"]),
 
+  // Per-user serialization document for the followed-countries watchlist.
+  // EVERY mutation that mutates `followedCountries` for a user reads AND
+  // writes this row, forcing Convex's per-document OCC to serialize
+  // concurrent same-user mutations. Without this, two parallel
+  // `followCountry` calls from the same user can both pass the cap check
+  // (Convex OCC tracks reads at the document level, not at the index-range
+  // level), both insert, and bypass the cap. The denormalized `count`
+  // also lets the cap check be O(1) instead of O(n) — happy side effect.
+  //
+  // Invariant: `count` MUST equal the row count of `followedCountries`
+  // for `userId`. The mutations are the only writers; tests assert this
+  // parity after every operation. See plan U13 / Codex round-3 P0
+  // (run 20260502-195816-dae403d7).
+  followedCountriesUserMeta: defineTable({
+    userId: v.string(),
+    count: v.number(),
+    updatedAt: v.number(),
+  }).index("by_user", ["userId"]),
+
   telegramPairingTokens: defineTable({
     userId: v.string(),
     token: v.string(),

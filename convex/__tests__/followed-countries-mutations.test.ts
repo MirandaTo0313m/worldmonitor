@@ -87,6 +87,49 @@ async function readUserFollows(
   });
 }
 
+/**
+ * Read the per-user serialization row's denormalized count. Returns 0
+ * if no row exists. Used to assert the cap-bypass parity invariant
+ * (`userMeta.count === COUNT(followedCountries WHERE userId=X)`).
+ */
+async function readUserMetaCount(
+  t: ReturnType<typeof convexTest>,
+  userId: string,
+): Promise<number> {
+  return await t.run(async (ctx) => {
+    const meta = await ctx.db
+      .query("followedCountriesUserMeta")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .unique();
+    return meta?.count ?? 0;
+  });
+}
+
+/**
+ * Hand-seed the followed-countries table AND the per-user serialization
+ * row so cap-check denominator is in parity. Use this in tests that need
+ * a pre-existing row state without going through `followCountry`. Without
+ * the user-meta seed, the cap check would read 0 (no meta row) and let
+ * a free user past the cap — masking real regressions in cap enforcement.
+ */
+async function seedFollowedCountries(
+  t: ReturnType<typeof convexTest>,
+  userId: string,
+  codes: string[],
+): Promise<void> {
+  await t.run(async (ctx) => {
+    const now = Date.now();
+    for (const country of codes) {
+      await ctx.db.insert("followedCountries", { userId, country, addedAt: now });
+    }
+    await ctx.db.insert("followedCountriesUserMeta", {
+      userId,
+      count: codes.length,
+      updatedAt: now,
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // ISO-2 registry parity — the registry mirrored into convex/lib/iso2.ts
 // MUST stay in lockstep with the keys of `ISO2_TO_ISO3` in
@@ -765,5 +808,252 @@ describe("constants — sanity", () => {
   test("COUNTRY_COUNT_PRIVACY_FLOOR is a positive integer", () => {
     expect(Number.isInteger(COUNTRY_COUNT_PRIVACY_FLOOR)).toBe(true);
     expect(COUNTRY_COUNT_PRIVACY_FLOOR).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-user serialization (cap-bypass mitigation, Codex round-3 P0)
+//
+// Convex per-document OCC tracks reads at the document level, NOT at the
+// index-range level. Without a per-user serialization document, two
+// parallel `followCountry` mutations from the SAME user can both pass the
+// cap check on a stale denominator and both insert — bypassing the free
+// cap and potentially creating duplicate (userId, country) rows.
+//
+// CONCURRENCY-SIMULATION CAVEAT (convex-test 0.0.43):
+//   `convex-test`'s TransactionManager (node_modules/convex-test/dist/
+//   index.js:1268) takes a single `_waitOnCurrentFunction` lock at the
+//   start of each top-level mutation, so `Promise.all([t.mutation(...),
+//   t.mutation(...)])` runs strictly sequentially even though the test
+//   author expresses parallelism. There is NO real OCC retry mechanism
+//   in the mock — the second mutation begins after the first commits.
+//
+//   What this means: tests CANNOT prove "loser retries and re-reads"
+//   directly. What they CAN prove is the FINAL-STATE INVARIANT — even
+//   when the second mutation runs back-to-back against the post-winner
+//   state, the cap, idempotency, and meta-parity invariants hold. In
+//   production, Convex's real OCC layer turns the same final-state
+//   invariant into the cap-bypass guarantee: the loser retries against
+//   the winner's commit and behaves exactly like the sequential second
+//   call here. So if these tests pass AND the meta read/write happens on
+//   every mutation path, the production fix holds.
+//
+//   See `convex-occ-retry-vs-app-cas-conflict-different-layers` (memory)
+//   for the layer separation; this test suite is the app-side invariant
+//   layer, the OCC retry is the platform layer we trust.
+// ---------------------------------------------------------------------------
+
+describe("per-user serialization — cap-bypass mitigation (P0)", () => {
+  test("concurrent same-user same-country: Promise.all of 2 followCountry('US') → exactly 1 row, counter=1, meta=1, second is idempotent", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    const [r1, r2] = await Promise.all([
+      asUser.mutation(api.followedCountries.followCountry, { country: "US" }),
+      asUser.mutation(api.followedCountries.followCountry, { country: "US" }),
+    ]);
+
+    // Exactly one of the two saw idempotent:false, the other idempotent:true.
+    // Order is implementation-defined under convex-test's serialization;
+    // we don't pin which one wins.
+    const idempotent = [r1.idempotent, r2.idempotent].sort();
+    expect(idempotent).toEqual([false, true]);
+
+    expect(await readUserFollows(t, USER_A.subject)).toEqual(["US"]);
+    expect(await readCounter(t, "US")).toBe(1);
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+  });
+
+  test("concurrent same-user cap-boundary: free user with 2 rows + Promise.all(follow('GB'), follow('JP')) → at most 3 rows, cap holds", async () => {
+    const t = convexTest(schema, modules);
+    // Free user (no PRO). Seed 2 of 3 cap slots.
+    await seedFollowedCountries(t, USER_A.subject, ["US", "DE"]);
+    const asUser = t.withIdentity(USER_A);
+
+    // Both calls target NEW countries. Under our fix: post-serialization,
+    // second call sees count=3 if the first succeeded, throws FREE_CAP.
+    const results = await Promise.allSettled([
+      asUser.mutation(api.followedCountries.followCountry, { country: "GB" }),
+      asUser.mutation(api.followedCountries.followCountry, { country: "JP" }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    // Either both fit (one succeeded → cap reached → second throws) OR
+    // both succeed because cap is exactly 3 and seeds put us at 2; here
+    // (2 + 2 attempts = 4 attempted, cap=3) → exactly one succeeds and
+    // one throws FREE_CAP.
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+      /FREE_CAP/,
+    );
+
+    // Final row count must NEVER exceed cap.
+    const finalCount = (await readUserFollows(t, USER_A.subject)).length;
+    expect(finalCount).toBeLessThanOrEqual(FREE_TIER_FOLLOW_LIMIT);
+    expect(finalCount).toBe(3); // 2 seeded + 1 winner
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(finalCount);
+  });
+
+  test("concurrent same-user mixed follow/unfollow on US: final state is consistent (count matches row count, no orphans)", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    // Seed US so unfollow has something to remove.
+    await seedFollowedCountries(t, USER_A.subject, ["US"]);
+    const asUser = t.withIdentity(USER_A);
+
+    const results = await Promise.allSettled([
+      asUser.mutation(api.followedCountries.followCountry, { country: "US" }),
+      asUser.mutation(api.followedCountries.unfollowCountry, { country: "US" }),
+    ]);
+
+    // Both mutations succeed (each is idempotent on its no-op branch).
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+    // Two consistent end-states are possible depending on serialization
+    // order:
+    //   (a) follow first (idempotent — already exists), then unfollow
+    //       (deletes) → 0 rows, meta=0, counter=0
+    //   (b) unfollow first (deletes), then follow (inserts) → 1 row,
+    //       meta=1, counter=1
+    const rows = await readUserFollows(t, USER_A.subject);
+    const meta = await readUserMetaCount(t, USER_A.subject);
+    const counter = await readCounter(t, "US");
+
+    // Parity invariant: meta count === row count for this user.
+    expect(meta).toBe(rows.length);
+    // counter parity: counter === row count for the country (single-user test).
+    expect(counter).toBe(rows.length);
+    // Either end-state.
+    expect([0, 1]).toContain(rows.length);
+  });
+
+  test("concurrent mergeAnonymousLocal from N tabs (free user, 5-element list) → final ≤ FREE_TIER_FOLLOW_LIMIT, no duplicate (userId, country) rows", async () => {
+    const t = convexTest(schema, modules);
+    // No PRO seed → free user, cap=3.
+    const asUser = t.withIdentity(USER_A);
+    const codes = ["US", "GB", "JP", "CN", "FR"];
+
+    // Simulate 5 tabs all calling mergeAnonymousLocal at the same time.
+    const N = 5;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, () =>
+        asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+          countries: codes,
+        }),
+      ),
+    );
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+    // Final row count must never exceed cap.
+    const rows = await readUserFollows(t, USER_A.subject);
+    expect(rows.length).toBeLessThanOrEqual(FREE_TIER_FOLLOW_LIMIT);
+    expect(rows.length).toBe(FREE_TIER_FOLLOW_LIMIT); // 3 of 5 fit
+
+    // No duplicate (userId, country) rows. (The set of countries should
+    // equal the row count.)
+    expect(new Set(rows).size).toBe(rows.length);
+
+    // Meta parity invariant.
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(rows.length);
+  });
+
+  test("concurrent mergeAnonymousLocal from N tabs (PRO user, 5-element list) → exactly the deduped union, no duplicates", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+    const codes = ["US", "GB", "JP", "CN", "FR"];
+
+    const N = 5;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, () =>
+        asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+          countries: codes,
+        }),
+      ),
+    );
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+    const rows = await readUserFollows(t, USER_A.subject);
+    expect(rows.length).toBe(codes.length);
+    expect(new Set(rows)).toEqual(new Set(codes));
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(codes.length);
+    // Each per-country counter should be exactly 1 (one user, one row each).
+    for (const c of codes) {
+      expect(await readCounter(t, c)).toBe(1);
+    }
+  });
+
+  test("user-meta count parity invariant after a sequence of mutations", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    await asUser.mutation(api.followedCountries.followCountry, { country: "US" });
+    await asUser.mutation(api.followedCountries.followCountry, { country: "GB" });
+    await asUser.mutation(api.followedCountries.followCountry, { country: "JP" });
+    await asUser.mutation(api.followedCountries.unfollowCountry, { country: "GB" });
+    await asUser.mutation(api.followedCountries.followCountry, { country: "US" }); // idempotent
+    await asUser.mutation(api.followedCountries.mergeAnonymousLocal, {
+      countries: ["DE", "FR", "GB"],
+    });
+
+    const rows = await readUserFollows(t, USER_A.subject);
+    const meta = await readUserMetaCount(t, USER_A.subject);
+    expect(meta).toBe(rows.length);
+    // Final set: ['US', 'JP', 'DE', 'FR', 'GB'] (5 rows) — order may differ.
+    expect(new Set(rows)).toEqual(new Set(["US", "JP", "DE", "FR", "GB"]));
+    expect(meta).toBe(5);
+  });
+
+  test("idempotent followCountry does NOT bump user-meta count", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    await asUser.mutation(api.followedCountries.followCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+    // Second call is idempotent.
+    await asUser.mutation(api.followedCountries.followCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+  });
+
+  test("idempotent unfollowCountry does NOT decrement user-meta count", async () => {
+    const t = convexTest(schema, modules);
+    await seedProEntitlement(t, USER_A.subject);
+    const asUser = t.withIdentity(USER_A);
+
+    // Unfollow on absent row — idempotent, no decrement.
+    await asUser.mutation(api.followedCountries.unfollowCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(0);
+
+    // Follow then unfollow then unfollow.
+    await asUser.mutation(api.followedCountries.followCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(1);
+    await asUser.mutation(api.followedCountries.unfollowCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(0);
+    // Idempotent unfollow — must NOT push count negative.
+    await asUser.mutation(api.followedCountries.unfollowCountry, { country: "US" });
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(0);
+  });
+
+  test("FREE_CAP throw rolls back all writes — meta is unchanged", async () => {
+    const t = convexTest(schema, modules);
+    // Free user at cap.
+    await seedFollowedCountries(t, USER_A.subject, ["US", "GB", "JP"]);
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(3);
+    const asUser = t.withIdentity(USER_A);
+
+    await expect(
+      asUser.mutation(api.followedCountries.followCountry, { country: "FR" }),
+    ).rejects.toThrow(/FREE_CAP/);
+
+    // Meta count, row count, and counter for FR must all be unchanged.
+    expect(await readUserMetaCount(t, USER_A.subject)).toBe(3);
+    expect((await readUserFollows(t, USER_A.subject)).length).toBe(3);
+    expect(await readCounter(t, "FR")).toBe(0);
   });
 });
