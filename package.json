@@ -54,6 +54,8 @@
   ],
   "_comment": "Personal fork for learning purposes - running locally on port 8080 instead of 3000",
   "config": {
-    "port": "8080"
+    "port": "8080",
+    "refreshInterval": "60",
+    "logLevel": "debug"
   }
 }
