@@ -14,7 +14,7 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "docker:build": "docker build -t worldmonitor .",
-    "docker:run": "docker run --env-file .env -p 3000:3000 worldmonitor"
+    "docker:run": "docker run --env-file .env -p 8080:8080 worldmonitor"
   },
   "dependencies": {
     "axios": "^1.6.0",
